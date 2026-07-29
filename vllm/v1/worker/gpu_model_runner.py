@@ -156,6 +156,7 @@ from vllm.v1.kv_cache_interface import (
     KVQuantMode,
     MambaSpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -435,6 +436,17 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+
+
+def _get_layer_cache_dtype_str(
+    kv_cache_spec: AttentionSpec, cache_dtype: str
+) -> str:
+    if (
+        kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+        and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+    ):
+        return "auto"
+    return getattr(kv_cache_spec, "cache_dtype_str", None) or cache_dtype
 
 
 class GPUModelRunner(
@@ -7189,15 +7201,9 @@ class GPUModelRunner(
 
                     # Skipped layers (--kv-cache-dtype-skip-layers) need
                     # the unquantized shape.
-                    layer_cache_dtype_str = (
-                        "auto"
-                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                        else getattr(
-                            kv_cache_spec,
-                            "cache_dtype_str",
-                            None,
-                        )
-                        or self.cache_config.cache_dtype
+                    layer_cache_dtype_str = _get_layer_cache_dtype_str(
+                        kv_cache_spec,
+                        self.cache_config.cache_dtype,
                     )
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,

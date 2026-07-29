@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    TQFullAttentionSpec,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -55,6 +56,41 @@ from vllm.v1.worker.utils import select_common_block_size
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_turboquant_cache_dtype_is_preserved_when_reshaping() -> None:
+    spec = TQFullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=128,
+        head_size_v=128,
+        dtype=torch.uint8,
+        tq_slot_size=196,
+    )
+
+    assert (
+        gpu_model_runner_module._get_layer_cache_dtype_str(
+            spec, "turboquant_k8v4"
+        )
+        == "turboquant_k8v4"
+    )
+
+
+def test_unquantized_cache_dtype_uses_auto_when_reshaping() -> None:
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=128,
+        head_size_v=128,
+        dtype=torch.bfloat16,
+    )
+
+    assert (
+        gpu_model_runner_module._get_layer_cache_dtype_str(
+            spec, "turboquant_k8v4"
+        )
+        == "auto"
+    )
 
 
 def initialize_kv_cache(runner: GPUModelRunner):
