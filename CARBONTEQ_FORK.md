@@ -2,7 +2,13 @@
 
 ## Status
 
-**Published v0.25.1 maintenance candidate.** This fork carries one bounded
+**Published source-overlay prerelease `carbonteq-v0.25.2.dev2`.** The manual
+GitHub release is pinned to commit
+`7817d845727af570352622dc8d58f2d43c76d89d` and retains a source archive with
+SHA-256 `8d4736461fbc3bf72075b4d84417208b3c5fc9ffc6f48bf26cbe9ef955cf307b`.
+This is deliberately not a CUDA wheel release: Posttrain's veRL runtime
+verifies the upstream ABI wheel separately and overlays this immutable fork
+source. No fork release runner was used. This fork carries one bounded
 TurboQuant correction required by the CarbonTeq post-training runtime. The
 source regression is validated locally; production qualification still
 requires the locked runtime image and a real hybrid Qwen rollout.
@@ -18,7 +24,8 @@ Expected remotes:
 - `upstream`: `https://github.com/vllm-project/vllm.git`
 
 Published implementation commit:
-`bd95cebbb6c7146f5b61bf39e532ca7591498430`.
+`bd95cebbb6c7146f5b61bf39e532ca7591498430`, retained in the released source
+revision `7817d845727af570352622dc8d58f2d43c76d89d`.
 
 ## Maintained delta
 
