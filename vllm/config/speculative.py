@@ -76,12 +76,14 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "custom_class",
+    "uno",
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
+UnoNoiseMode = Literal["mask", "random_uniform"]
 
 _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
     {
@@ -427,6 +429,17 @@ class SpeculativeConfig:
     """The specific revision to use for the draft model code on Hugging Face
     Hub. It can be a branch name, a tag name, or a commit id. If unspecified,
     will use the default version."""
+    uno_adapter: str | None = None
+    """Uno adapter repository or local path. This is a conditional LoRA
+    overlay for draft-noise positions, not a second causal language model."""
+    uno_adapter_revision: str | None = None
+    """Revision of the Uno adapter. Reproducible consumers should provide an
+    immutable commit SHA; local adapter paths omit it."""
+    uno_mask_token_id: int | None = Field(default=None, ge=2)
+    """Exclusive upper bound for Uno random replacement tokens and the token
+    used directly when ``uno_noise_mode`` is ``mask``."""
+    uno_noise_mode: UnoNoiseMode = "random_uniform"
+    """Noise supplied to future positions during the parallel Uno draft pass."""
     index_share_for_mtp_iteration: bool | None = None
     """Override whether MTP iterations reuse the first step's sparse indices.
     If `None`, use the value from the draft model's Hugging Face config."""
@@ -1117,6 +1130,12 @@ class SpeculativeConfig:
             else:
                 self.method = "draft_model"
 
+        if self.method == "uno" and self.model is not None:
+            raise ValueError(
+                "method='uno' uses the target model; pass uno_adapter instead "
+                "of speculative_config.model"
+            )
+
         if self.method in get_args(MTPModelTypes) and self.method != "mtp":
             logger.warning(
                 "method `%s` is deprecated and replaced with mtp.", self.method
@@ -1163,6 +1182,11 @@ class SpeculativeConfig:
                         "method='custom_class' requires 'model' to contain the "
                         "custom proposer module path (e.g., 'my_module.MyProposer')."
                     )
+            elif self.method == "uno":
+                if self.target_model_config is None:
+                    raise ValueError("method='uno' requires target_model_config")
+                if self.target_parallel_config is None:
+                    raise ValueError("method='uno' requires target_parallel_config")
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
@@ -1218,6 +1242,19 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "uno":
+            # Uno drafts with the target model plus a position-gated adapter.
+            # No second model or separate draft KV cache is allocated.
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+            self.parallel_drafting = True
+            # The target model's CUDA graphs capture target-runner buffers.
+            # Replaying them from the shared-model proposer would read stale
+            # inputs and KV metadata. Keep only the proposer eager until Uno
+            # owns a separately captured graph with its own stable buffers.
+            self.enforce_eager = True
         elif self.method == "extract_hidden_states":
             from vllm.transformers_utils.configs.extract_hidden_states import (
                 ExtractHiddenStatesConfig,
@@ -1801,6 +1838,29 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
+        if self.method == "uno":
+            if not isinstance(self.uno_adapter, str) or not self.uno_adapter.strip():
+                raise ValueError("method='uno' requires a non-empty uno_adapter")
+            if self.model is not None:
+                raise ValueError(
+                    "method='uno' uses the target model; pass uno_adapter instead "
+                    "of speculative_config.model"
+                )
+            if self.uno_mask_token_id is None:
+                raise ValueError("method='uno' requires uno_mask_token_id")
+            if self.target_parallel_config.tensor_parallel_size != 1:
+                raise ValueError(
+                    "method='uno' initially supports tensor parallel size 1"
+                )
+            if self.target_parallel_config.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "method='uno' initially supports pipeline parallel size 1"
+                )
+        elif self.uno_adapter is not None or self.uno_adapter_revision is not None:
+            raise ValueError(
+                "uno_adapter and uno_adapter_revision require method='uno'"
+            )
+
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -1882,6 +1942,11 @@ class SpeculativeConfig:
             # DFlash uses one bonus query followed by K mask queries.
             return num_draft_tokens
 
+        if self.use_uno():
+            # The ordinary query slot is the causal seed. Uno adds one noise
+            # position for each proposed future token.
+            return num_draft_tokens
+
         if self.parallel_drafting:
             if self.uses_draft_model():
                 # PARD does not shift the existing input, so all K query
@@ -1929,6 +1994,9 @@ class SpeculativeConfig:
     def use_dspark(self) -> bool:
         return self.method == "dspark"
 
+    def use_uno(self) -> bool:
+        return self.method == "uno"
+
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
 
@@ -1966,6 +2034,7 @@ class SpeculativeConfig:
                 "suffix",
                 "extract_hidden_states",
                 "custom_class",
+                "uno",
             )
             else self.draft_model_config.model
         )
