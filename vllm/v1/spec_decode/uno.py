@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
-_UNO_ADAPTER_ID = 2_147_483_000
+UNO_DRAFT_ADAPTER_ID = 2_147_483_000
 
 
 class UnoProposer(SpecDecodeBaseProposer):
@@ -49,7 +49,7 @@ class UnoProposer(SpecDecodeBaseProposer):
         self.runner = runner
         self.uno_adapter_request = LoRARequest(
             lora_name="__vllm_uno_draft__",
-            lora_int_id=_UNO_ADAPTER_ID,
+            lora_int_id=UNO_DRAFT_ADAPTER_ID,
             lora_path=spec.uno_adapter or "",
         )
         super().__init__(
@@ -82,7 +82,8 @@ class UnoProposer(SpecDecodeBaseProposer):
         if not self._draft_attn_layer_names:
             raise ValueError("Uno requires at least one target attention layer")
         self.runner.add_lora(self.uno_adapter_request)
-        self.runner.pin_lora(self.uno_adapter_request.lora_int_id)
+        if not self.speculative_config.uno_composes_request_lora:
+            self.runner.pin_lora(self.uno_adapter_request.lora_int_id)
 
     @override
     def model_returns_tuple(self) -> bool:
@@ -92,7 +93,7 @@ class UnoProposer(SpecDecodeBaseProposer):
     def _build_lora_mappings(
         noise_mask: torch.Tensor,
         token_indices_to_sample: torch.Tensor,
-        adapter_id: int = _UNO_ADAPTER_ID,
+        adapter_id: int = UNO_DRAFT_ADAPTER_ID,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Return output and input mappings for position-gated Uno LoRA."""
         token_noise = noise_mask.detach().to(device="cpu", dtype=torch.bool).tolist()
@@ -106,6 +107,26 @@ class UnoProposer(SpecDecodeBaseProposer):
         prompt_mapping = tuple(adapter_id if enabled else 0 for enabled in sample_noise)
         return prompt_mapping, token_mapping
 
+    @staticmethod
+    def _build_composite_lora_mappings(
+        noise_mask: torch.Tensor,
+        token_indices_to_sample: torch.Tensor,
+        policy_lora_ids: torch.Tensor,
+        num_speculative_tokens: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Map seed rows to policy LoRA and noise rows to policy-plus-Uno."""
+        expanded_policy_ids = policy_lora_ids.repeat_interleave(num_speculative_tokens)
+        token_mapping_tensor = torch.where(
+            noise_mask,
+            UNO_DRAFT_ADAPTER_ID,
+            expanded_policy_ids,
+        )
+        token_mapping = tuple(token_mapping_tensor.cpu().tolist())
+        prompt_mapping = tuple(
+            token_mapping_tensor[token_indices_to_sample.long()].cpu().tolist()
+        )
+        return prompt_mapping, token_mapping
+
     @override
     def set_inputs_first_pass(
         self,
@@ -117,15 +138,18 @@ class UnoProposer(SpecDecodeBaseProposer):
         cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
-        if np.any(
-            self.runner.input_batch.request_lora_mapping[
-                : self.runner.input_batch.num_reqs
-            ]
-            > 0
-        ):
+        request_lora_ids = self.runner.input_batch.request_lora_mapping[
+            : self.runner.input_batch.num_reqs
+        ]
+        composes_request_lora = self.speculative_config.uno_composes_request_lora
+        if np.any(request_lora_ids > 0) and not composes_request_lora:
             raise ValueError(
-                "Uno with a request/policy LoRA is not qualified yet; use a "
-                "full-weight target policy"
+                "Uno request LoRA requires uno_composes_request_lora=true and "
+                "a policy-plus-Uno composite adapter"
+            )
+        if composes_request_lora and np.any(request_lora_ids <= 0):
+            raise ValueError(
+                "Uno composite mode requires one request/policy LoRA for every sequence"
             )
 
         _, expanded_sample_indices, expanded_metadata = super().set_inputs_first_pass(
@@ -187,12 +211,35 @@ class UnoProposer(SpecDecodeBaseProposer):
                 device=self.input_ids.device,
             )
 
-        prompt_mapping, token_mapping = self._build_lora_mappings(
-            noise_mask, sample_indices
-        )
+        active_loras = {self.uno_adapter_request}
+        if composes_request_lora:
+            policy_ids = torch.as_tensor(
+                request_lora_ids,
+                dtype=torch.int64,
+                device=noise_mask.device,
+            )
+            prompt_mapping, token_mapping = self._build_composite_lora_mappings(
+                noise_mask,
+                sample_indices,
+                policy_ids,
+                self.num_speculative_tokens,
+            )
+            for policy_id in np.unique(request_lora_ids):
+                request = self.runner.input_batch.lora_id_to_lora_request.get(
+                    int(policy_id)
+                )
+                if request is None:
+                    raise ValueError(
+                        f"Uno composite mode cannot resolve policy LoRA {policy_id}"
+                    )
+                active_loras.add(request)
+        else:
+            prompt_mapping, token_mapping = self._build_lora_mappings(
+                noise_mask, sample_indices
+            )
         self.runner._set_active_loras(
             prompt_mapping,
             token_mapping,
-            {self.uno_adapter_request},
+            active_loras,
         )
         return num_tokens, sample_indices, metadata

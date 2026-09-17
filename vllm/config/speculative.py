@@ -440,6 +440,9 @@ class SpeculativeConfig:
     used directly when ``uno_noise_mode`` is ``mask``."""
     uno_noise_mode: UnoNoiseMode = "random_uniform"
     """Noise supplied to future positions during the parallel Uno draft pass."""
+    uno_composes_request_lora: bool = False
+    """Treat ``uno_adapter`` as policy-plus-Uno composite weights. Target and
+    seed rows use the request LoRA; draft-noise rows use this composite."""
     index_share_for_mtp_iteration: bool | None = None
     """Override whether MTP iterations reuse the first step's sparse indices.
     If `None`, use the value from the draft model's Hugging Face config."""
@@ -1856,10 +1859,12 @@ class SpeculativeConfig:
                 raise ValueError(
                     "method='uno' initially supports pipeline parallel size 1"
                 )
-        elif self.uno_adapter is not None or self.uno_adapter_revision is not None:
-            raise ValueError(
-                "uno_adapter and uno_adapter_revision require method='uno'"
-            )
+        elif (
+            self.uno_adapter is not None
+            or self.uno_adapter_revision is not None
+            or self.uno_composes_request_lora
+        ):
+            raise ValueError("Uno adapter settings require method='uno'")
 
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
