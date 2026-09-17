@@ -19,6 +19,9 @@ It is not yet the Posttrain production pin.
 - Position-gated LoRA application: the Uno adapter is active only on future
   noise rows; vLLM's target sampler, verifier, and logprob path remain
   authoritative.
+- Native policy-LoRA composition: target and seed rows select the request
+  policy adapter, while noise rows select an atomically refreshed
+  policy-plus-Uno composite adapter.
 - Compact proposal inputs containing the target-sampled seed plus noise rows.
 - Eager proposal forwards while target execution stays compiled. A dedicated,
   shape-safe Uno CUDA graph may replace this guard after qualification.
@@ -26,10 +29,9 @@ It is not yet the Posttrain production pin.
 ## Compatibility constraints
 
 - Tensor parallel size 1 and pipeline parallel size 1.
-- LoRA enabled with at least two slots; one slot is pinned for Uno and the
-  second permits vLLM startup profiling.
-- Full-weight target policy only. Request/policy LoRA plus Uno is rejected
-  until a dual-adapter path is implemented and qualified.
+- Full-weight targets require at least two LoRA slots for fixed Uno plus startup
+  profiling. Policy-LoRA targets require three slots and a supported rank at
+  least as large as policy rank plus Uno rank.
 - The target model vocabulary upper bound must be provided as
   `uno_mask_token_id`.
 
@@ -50,8 +52,11 @@ ruff check \
   tests/v1/spec_decode/test_uno.py
 ```
 
-The retained RTX PRO environment passed seven focused tests and the native GPU
-smokes recorded in the Posttrain consumer documentation.
+The retained RTX PRO environment passes the focused mapping tests and the
+native GPU smokes recorded in the Posttrain consumer documentation. A real K2
+rank-8 policy-LoRA optimizer step also passed across policy versions `0` and
+`1`, with 32/32 finite target logprobs and maximum post-update logprob movement
+`0.0655067` while completion tokens stayed stable.
 
 ## Rebase procedure
 
@@ -67,8 +72,7 @@ smokes recorded in the Posttrain consumer documentation.
 
 - Distributional equivalence against ordinary vLLM.
 - Abort/drain and mixed-batch churn.
-- Sleep/wake and prefix-cache invalidation.
 - Full-weight refresh across a known optimizer step with policy-version
   fencing and fresh target logprobs.
 - Matched warm long-prompt throughput comparison.
-- Policy-LoRA composition before claiming LoRA or QLoRA rollout support.
+- QLoRA remains independently unsupported.
