@@ -13,7 +13,9 @@ production pin.
 - Development branch: `codex/uno-spec-decoding`
 - Release branch: `codex/uno-spec-decoding`
 - Candidate tag: `carbonteq-v0.26.1.dev1`
-- Published CarbonTeq commit: the commit carrying this ledger update
+- Published CarbonTeq commit: `37706e7d920abc97c705ffecee0919d64ef31485`
+- Source archive SHA-256:
+  `4d1263e77cc9c36a63874efa7f9cf42cb42687282e13b87294edcbe40918a135`
 
 ## Maintained delta
 
