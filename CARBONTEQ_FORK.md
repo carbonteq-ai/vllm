@@ -1,14 +1,19 @@
 # CarbonTeq vLLM fork
 
-This branch carries CarbonTeq's experimental native Uno Psi-Spec integration.
-It is not yet the Posttrain production pin.
+This branch carries CarbonTeq's native Uno Psi-Spec integration.
+
+Release candidate: `carbonteq-v0.26.1.dev1`. This is a source-overlay
+prerelease for TRL and veRL qualification; it is not yet the stable Posttrain
+production pin.
 
 ## Upstream base
 
 - Repository: `https://github.com/vllm-project/vllm`
 - Commit: `75c71390d5b399f5397a9166920fc45902f99f14`
 - Development branch: `codex/uno-spec-decoding`
-- Published CarbonTeq commit: pending qualification and push
+- Release branch: `codex/uno-spec-decoding`
+- Candidate tag: `carbonteq-v0.26.1.dev1`
+- Published CarbonTeq commit: the commit carrying this ledger update
 
 ## Maintained delta
 
@@ -52,8 +57,9 @@ ruff check \
   tests/v1/spec_decode/test_uno.py
 ```
 
-The retained RTX PRO environment passes the focused mapping tests and the
-native GPU smokes recorded in the Posttrain consumer documentation. A real K2
+The retained RTX PRO environment passes all eight focused configuration and
+proposer tests, plus the native GPU smokes recorded in the Posttrain consumer
+documentation. A real K2
 rank-8 policy-LoRA optimizer step also passed across policy versions `0` and
 `1`, with 32/32 finite target logprobs and maximum post-update logprob movement
 `0.0655067` while completion tokens stayed stable.
@@ -68,7 +74,7 @@ rank-8 policy-LoRA optimizer step also passed across policy versions `0` and
    optimizer-update qualification on the RTX PRO.
 5. Push the fork commit before advancing any Posttrain pin or lockfile.
 
-## Remaining release gates
+## Remaining stable-promotion gates
 
 - Distributional equivalence against ordinary vLLM.
 - Abort/drain and mixed-batch churn.
