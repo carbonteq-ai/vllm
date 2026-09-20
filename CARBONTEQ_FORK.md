@@ -16,7 +16,7 @@ compilation.
 - Expected upstream: `https://github.com/vllm-project/vllm.git`
 - Development branch: `codex/sm120-attention-platform`
 - Published CarbonTeq functional commit:
-  `e1b009d3d4106cfeacec04dd251b3bc3b82eea28`
+  `e1b009d3d43fa631524968241390155590f90d0a`
 
 ## Maintained delta
 
