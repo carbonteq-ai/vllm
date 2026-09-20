@@ -22,7 +22,10 @@ from setuptools_rust.build import build_rust
 from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
-# Select vLLM release tags, excluding crate tags such as "proto-v0.3.0".
+# Select upstream or CarbonTeq vLLM release tags while excluding crate tags
+# such as "proto-v0.3.0". Direct Git installs of the fork must derive their
+# package version from the CarbonTeq release tag instead of the oldest upstream
+# tag mirrored into the fork.
 VLLM_GIT_DESCRIBE_COMMAND = [
     "git",
     "describe",
@@ -32,6 +35,8 @@ VLLM_GIT_DESCRIBE_COMMAND = [
     "--abbrev=40",
     "--match",
     "v[0-9]*",
+    "--match",
+    "carbonteq-v[0-9]*",
 ]
 
 
