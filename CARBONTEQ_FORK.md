@@ -1,6 +1,6 @@
 # CarbonTeq vLLM fork
 
-Status: release candidate.
+Status: published development release.
 
 This branch carries CarbonTeq's native Uno Psi-Spec integration and optional
 SM120 paged-attention backend. Posttrain may select this candidate for the
@@ -15,7 +15,8 @@ compilation.
 - Expected origin: `git@github.com:carbonteq-ai/vllm.git`
 - Expected upstream: `https://github.com/vllm-project/vllm.git`
 - Development branch: `codex/sm120-attention-platform`
-- Published CarbonTeq commit: pending qualification and push
+- Published CarbonTeq functional commit:
+  `e1b009d3d4106cfeacec04dd251b3bc3b82eea28`
 
 ## Maintained delta
 
