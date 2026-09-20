@@ -177,6 +177,43 @@ _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS: dict[
             ),
         ),
     },
+    "sm120": {
+        # K2-Horizon 7B / 4K-hidden Blackwell shapes. All M buckets retain one
+        # shape-wide K tile so changing concurrency cannot change reduction
+        # order. Configurations were measured directly on SM120 at c4-c32.
+        (6144, 4096): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=(
+                (64, _MatmulMConfig(16, 128, 4, 4)),
+                (320, _MatmulMConfig(32, 128, 8, 4)),
+                (65536, _MatmulMConfig(128, 128, 8, 3)),
+            ),
+        ),
+        (4096, 4096): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=(
+                (96, _MatmulMConfig(16, 128, 4, 4)),
+                (192, _MatmulMConfig(32, 128, 8, 4)),
+                (65536, _MatmulMConfig(128, 128, 8, 3)),
+            ),
+        ),
+        (24576, 4096): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=(
+                (64, _MatmulMConfig(16, 128, 4, 4)),
+                (192, _MatmulMConfig(32, 128, 8, 4)),
+                (65536, _MatmulMConfig(128, 128, 8, 3)),
+            ),
+        ),
+        (4096, 12288): _MatmulShapeConfig(
+            block_k=64,
+            m_buckets=(
+                (64, _MatmulMConfig(16, 128, 4, 4)),
+                (192, _MatmulMConfig(32, 128, 8, 4)),
+                (65536, _MatmulMConfig(128, 128, 8, 3)),
+            ),
+        ),
+    },
     "blackwell": {
         (12288, 2048): _MatmulShapeConfig(
             block_k=64,
@@ -265,6 +302,8 @@ _TUNED_MATMUL_CONFIGS_RESOLVED = False
 def _get_tuned_matmul_arch_family(capability: DeviceCapability | None) -> str | None:
     if capability is None:
         return None
+    if capability.major == 12:
+        return "sm120"
     if capability.major == 10:
         return "blackwell"
     if capability.major == 9:

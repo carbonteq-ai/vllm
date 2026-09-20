@@ -10,14 +10,21 @@ import pytest
 import torch
 from utils import skip_unsupported
 
-from vllm.model_executor.determinism.batch_invariant import matmul_batch_invariant
+from vllm.model_executor.determinism.batch_invariant import (
+    matmul_batch_invariant,
+)
 from vllm.model_executor.determinism.batch_invariant_configs import (
     _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS,
     _get_tuned_matmul_arch_family,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_sm120_uses_dedicated_tuned_config_family():
+    assert _get_tuned_matmul_arch_family(DeviceCapability(12, 0)) == "sm120"
 
 
 @skip_unsupported

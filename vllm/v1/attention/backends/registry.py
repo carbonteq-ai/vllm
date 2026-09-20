@@ -118,6 +118,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.models.deepseek_v41.sparse_mla.FlashMLAMegaAttnBackend"
     )
     B12X = "vllm.v1.attention.backends.b12x.B12xPagedAttentionBackend"
+    SM120_FA4 = "vllm.v1.attention.backends.sm120_fa4.Sm120FA4Backend"
     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
     FLASH_ATTN_MLA_SPARSE = (
         "vllm.v1.attention.backends.mla.flashattn_mla_sparse.FlashAttnMLASparseBackend"

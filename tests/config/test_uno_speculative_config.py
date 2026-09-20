@@ -38,6 +38,40 @@ def test_uno_reuses_target_model_and_reserves_noise_slots() -> None:
     assert config.enforce_eager is True
 
 
+
+
+def test_uno_proposer_remains_eager_when_false_is_requested() -> None:
+    model, parallel = _target_configs()
+
+    config = SpeculativeConfig(
+        method="uno",
+        num_speculative_tokens=7,
+        uno_adapter="IFM/K2-Horizon-7B-Uno",
+        uno_mask_token_id=250624,
+        enforce_eager=False,
+        target_model_config=model,
+        target_parallel_config=parallel,
+    )
+
+    assert config.enforce_eager is True
+
+
+def test_uno_rejects_out_of_vocab_mask_before_gpu_submission() -> None:
+    model, parallel = _target_configs()
+    model.get_vocab_size.return_value = 250624
+
+    with pytest.raises(ValidationError, match="inside the target embedding vocabulary"):
+        SpeculativeConfig(
+            method="uno",
+            num_speculative_tokens=7,
+            uno_adapter="IFM/K2-Horizon-7B-Uno",
+            uno_mask_token_id=250624,
+            uno_noise_mode="mask",
+            target_model_config=model,
+            target_parallel_config=parallel,
+        )
+
+
 @pytest.mark.parametrize(
     "kwargs,match",
     [

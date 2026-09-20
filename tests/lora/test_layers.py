@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.config.lora import LoRAConfig
+from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.lora.layers import (
     BaseLayerWithLoRA,
     ColumnParallelLinearWithLoRA,
@@ -52,6 +53,41 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 from .utils import DummyLoRAManager
+
+
+def test_system_lora_overlay_uses_independent_row_mask(dist_init) -> None:
+    with torch.device("cpu"):
+        linear = ReplicatedLinear(
+            3, 2, bias=False, params_dtype=torch.float32, prefix="system_overlay"
+        )
+        layer = ReplicatedLinearWithLoRA(linear)
+        layer.create_lora_weights(
+            2,
+            LoRAConfig(max_loras=2, max_lora_rank=8, lora_dtype=torch.float32),
+        )
+    lora_a = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    lora_b = torch.tensor([[2.0, 0.0], [0.0, 3.0]])
+    layer.set_lora(1, lora_a, lora_b)
+    layer.set_system_lora_slot(1)
+
+    inputs = torch.tensor([[1.0, 2.0, 4.0], [5.0, 6.0, 7.0]])
+    base_output = torch.zeros(2, 2)
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        system_lora_mask=torch.tensor([False, True]),
+    )
+    with override_forward_context(context):
+        actual = layer._apply_system_lora_overlay(inputs, base_output)
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([[0.0, 0.0], [10.0, 18.0]]),
+        rtol=0,
+        atol=0,
+    )
+
 
 TOLERANCES = {
     torch.float16: (5e-3, 5e-3),

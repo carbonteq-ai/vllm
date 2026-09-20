@@ -322,12 +322,12 @@ def matmul_persistent(
             "num_warps": 8,
         },
         torch.float32: {
-            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_M": 16 if M <= 64 else 128,
             "BLOCK_SIZE_N": _fp32_block_size_n if N == 1 else 128,
             "BLOCK_SIZE_K": 32,
             "GROUP_SIZE_M": 8,
-            "num_stages": _fp32_num_stages if N == 1 else 3,
-            "num_warps": 8,
+            "num_stages": _fp32_num_stages if N == 1 else (4 if M <= 64 else 3),
+            "num_warps": 4 if M <= 64 else 8,
         },
     }
     matmul_kernel_persistent[grid](

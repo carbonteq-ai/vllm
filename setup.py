@@ -1548,6 +1548,14 @@ setup(
         "deepstream": ["nvidia-deepstream-videodecode-cu13>=9.0.2"],
         "flashinfer": [],  # Kept for backwards compatibility
         "b12x": ["b12x==1.3.0"],
+        "sm120": [
+            (
+                "sm120-paged-attention @ "
+                "git+https://github.com/carbonteq-ai/"
+                "sm120-paged-attention.git@"
+                "99a6fe0acbb4756735aa8e47236f8b74e3f7c4be"
+            )
+        ],
         # Optional deps for Helion kernel development
         # NOTE: When updating helion version, also update CI files:
         #   - .buildkite/test_areas/kernels.yaml

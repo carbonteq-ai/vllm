@@ -19,6 +19,7 @@ from vllm.lora.layers import (
     LoRAMapping,
     LoRAMappingType,
 )
+from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel, MoEEPLoadSpec
 from vllm.lora.lora_weights import (
     LoRAFullModuleWeights,
@@ -120,6 +121,7 @@ class LoRAModelManager:
         )
         self.max_num_batched_tokens = math.ceil(max_num_batched_tokens / 8) * 8
         self.lora_index_to_id: list[int | None] = [None] * self.lora_slots
+        self._reserved_adapter_ids: set[int] = set()
         self.vocab_size = vocab_size
 
         self.is_pooling_model = is_pooling_model(self.model)
@@ -426,7 +428,9 @@ class LoRAModelManager:
             "Use LRUCacheLoRAModelManager for pinning"
         )  # type: ignore
 
-    def _set_adapter_mapping(self, mapping: LoRAMapping) -> None:
+    def _set_adapter_mapping(
+        self, mapping: LoRAMapping, metadata_bank: str = "target"
+    ) -> None:
         # Default to the main language model wrapper
         if not (self.supports_mm and self.supports_tower_connector_lora):
             target_prefix = (
@@ -443,6 +447,7 @@ class LoRAModelManager:
 
         punica_wrapper = self._get_punica_wrapper(target_prefix)
         assert punica_wrapper is not None
+        punica_wrapper.activate_metadata_bank(metadata_bank)
 
         punica_wrapper.update_metadata(
             mapping,
@@ -451,11 +456,46 @@ class LoRAModelManager:
             self.vocab_size,
         )
 
-    def remove_all_adapters(self):
-        """Remove all LoRAModels from the manager."""
+    def reserve_adapter(self, lora_id: int) -> bool:
+        """Pin a runtime-owned adapter and preserve its slot identity."""
+        if lora_id not in self._registered_adapters:
+            raise ValueError(f"Cannot reserve unloaded LoRA {lora_id}")
+        self.pin_adapter(lora_id)
+        self._reserved_adapter_ids.add(lora_id)
+        return True
+
+    def enable_system_overlay(self, lora_id: int) -> int:
+        """Expose a reserved adapter through position-gated row masking."""
+        if lora_id not in self._reserved_adapter_ids:
+            raise ValueError(f"System overlay LoRA {lora_id} must be reserved first")
+        try:
+            slot = self.lora_index_to_id.index(lora_id)
+        except ValueError as error:
+            raise ValueError(
+                f"System overlay LoRA {lora_id} has no active slot"
+            ) from error
+        for module in self.modules.values():
+            if isinstance(module, BaseLinearLayerWithLoRA):
+                module.set_system_lora_slot(slot)
+        return slot
+
+    @property
+    def num_reserved_adapters(self) -> int:
+        return len(self._reserved_adapter_ids)
+
+    def remove_all_adapters(self, *, preserve_reserved: bool = False):
+        """Remove adapters, optionally retaining runtime-owned reservations."""
+        if preserve_reserved:
+            for adapter_id in tuple(self._registered_adapters):
+                if adapter_id not in self._reserved_adapter_ids:
+                    self.remove_adapter(adapter_id)
+            self._last_mapping = None
+            self._last_slot_layout = None
+            return
         self._registered_adapters.clear()
         self.lora_index_to_id = [None] * self.lora_slots
         self._active_adapters.clear()
+        self._reserved_adapter_ids.clear()
         self._last_mapping = None
         self._last_slot_layout = None
 
@@ -1320,13 +1360,29 @@ class LoRAModelManager:
         self._add_adapter(adapter)
         return True
 
-    def set_adapter_mapping(self, mapping: LoRAMapping) -> None:
+    def set_adapter_mapping(
+        self, mapping: LoRAMapping, metadata_bank: str = "target"
+    ) -> None:
+        seen_wrappers: set[int] = set()
+        for punica_wrapper in self.punica_wrapper_mapping.values():
+            wrapper_id = id(punica_wrapper)
+            if wrapper_id in seen_wrappers:
+                continue
+            punica_wrapper.activate_metadata_bank(metadata_bank)
+            seen_wrappers.add(wrapper_id)
         # The punica metadata derives from the slot layout as well as the
         # mapping: an out-of-band add_lora() can LRU-evict and reassign slots
         # while the running batch, and thus the mapping, is unchanged.
         slot_layout = tuple(self.lora_index_to_id)
-        if self._last_mapping != mapping or self._last_slot_layout != slot_layout:
-            self._set_adapter_mapping(mapping)
+        # Non-target owners have independent device buffers and therefore must
+        # not share the target bank's update-elision cache.
+        if (
+            metadata_bank != "target"
+            or self._last_mapping != mapping
+            or self._last_slot_layout != slot_layout
+        ):
+            self._set_adapter_mapping(mapping, metadata_bank)
+        if metadata_bank == "target":
             self._last_mapping = mapping
             self._last_slot_layout = slot_layout
 

@@ -275,7 +275,16 @@ class SpecDecodingProm:
         self.counter_spec_decode_num_accepted_tokens[engine_idx].inc(
             spec_decoding_stats.num_accepted_tokens
         )
-        for pos, counter in enumerate(
-            self.counter_spec_decode_num_accepted_tokens_per_pos.get(engine_idx, [])
-        ):
-            counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
+        counters = self.counter_spec_decode_num_accepted_tokens_per_pos.get(
+            engine_idx, []
+        )
+        accepted_per_pos = spec_decoding_stats.num_accepted_tokens_per_pos
+        if len(counters) != len(accepted_per_pos):
+            logger.error_once(
+                "Spec-decode metrics position mismatch: allocated %d counters "
+                "but scheduler emitted %d positions. Recording the shared prefix.",
+                len(counters),
+                len(accepted_per_pos),
+            )
+        for counter, accepted in zip(counters, accepted_per_pos):
+            counter.inc(accepted)

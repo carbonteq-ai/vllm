@@ -194,10 +194,15 @@ class WorkerLoRAManager:
     def pin_adapter(self, adapter_id: int) -> bool:
         return self._adapter_manager.pin_adapter(adapter_id)
 
-    def set_active_adapters(self, requests: set[Any], mapping: Any | None) -> None:
+    def set_active_adapters(
+        self,
+        requests: set[Any],
+        mapping: Any | None,
+        metadata_bank: str = "target",
+    ) -> None:
         self._apply_adapters(requests)
         if mapping is not None:
-            self._adapter_manager.set_adapter_mapping(mapping)
+            self._adapter_manager.set_adapter_mapping(mapping, metadata_bank)
 
     def supports_tower_connector_lora(self) -> bool:
         return (
@@ -237,8 +242,20 @@ class WorkerLoRAManager:
     def remove_adapter(self, adapter_id: int) -> bool:
         return self._adapter_manager.remove_adapter(adapter_id)
 
-    def remove_all_adapters(self):
-        self._adapter_manager.remove_all_adapters()
+    def remove_all_adapters(self, *, preserve_reserved: bool = False):
+        self._adapter_manager.remove_all_adapters(
+            preserve_reserved=preserve_reserved
+        )
+
+    def reserve_adapter(self, adapter_id: int) -> bool:
+        return self._adapter_manager.reserve_adapter(adapter_id)
+
+    def enable_system_overlay(self, adapter_id: int) -> int:
+        return self._adapter_manager.enable_system_overlay(adapter_id)
+
+    @property
+    def num_reserved_adapters(self) -> int:
+        return self._adapter_manager.num_reserved_adapters
 
     def list_adapters(self) -> set[int]:
         return set(self._adapter_manager.list_adapters())

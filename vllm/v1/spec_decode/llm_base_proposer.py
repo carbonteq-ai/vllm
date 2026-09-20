@@ -70,6 +70,10 @@ logger = init_logger(__name__)
 
 
 class SpecDecodeBaseProposer:
+    def _system_lora_mask(self, num_input_tokens: int) -> torch.Tensor | None:
+        """Return a persistent row mask for an optional runtime LoRA overlay."""
+        return None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -599,6 +603,8 @@ class SpecDecodeBaseProposer:
             slot_mapping=self._get_slot_mapping(
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
+            skip_compiled=self._system_lora_mask(num_input_tokens) is not None,
+            system_lora_mask=self._system_lora_mask(num_input_tokens),
         ):
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
@@ -753,6 +759,7 @@ class SpecDecodeBaseProposer:
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
+                system_lora_mask=self._system_lora_mask(input_batch_size),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():
@@ -1655,6 +1662,8 @@ class SpecDecodeBaseProposer:
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=slot_mapping_dict,
+                skip_compiled=self._system_lora_mask(num_input_tokens) is not None,
+                system_lora_mask=self._system_lora_mask(num_input_tokens),
             ):
                 if self.supports_mm_inputs:
                     input_ids = None

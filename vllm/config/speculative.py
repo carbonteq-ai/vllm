@@ -1253,10 +1253,9 @@ class SpeculativeConfig:
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
             self.parallel_drafting = True
-            # The target model's CUDA graphs capture target-runner buffers.
-            # Replaying them from the shared-model proposer would read stale
-            # inputs and KV metadata. Keep only the proposer eager until Uno
-            # owns a separately captured graph with its own stable buffers.
+            # The proposer shares target weights and KV state. Its CUDA replay
+            # path is not qualified, so only the proposer stays eager while the
+            # target may retain its normal compiled decode path.
             self.enforce_eager = True
         elif self.method == "extract_hidden_states":
             from vllm.transformers_utils.configs.extract_hidden_states import (
@@ -1851,6 +1850,19 @@ class SpeculativeConfig:
                 )
             if self.uno_mask_token_id is None:
                 raise ValueError("method='uno' requires uno_mask_token_id")
+            if self.uno_noise_mode == "mask":
+                target_vocab_size = self.target_model_config.get_vocab_size()
+                if (
+                    isinstance(target_vocab_size, int)
+                    and self.uno_mask_token_id >= target_vocab_size
+                ):
+                    raise ValueError(
+                        "uno_noise_mode='mask' requires uno_mask_token_id to be "
+                        "inside the target embedding vocabulary; got "
+                        f"{self.uno_mask_token_id} for vocab size "
+                        f"{target_vocab_size}. Use random_uniform when the Uno "
+                        "checkpoint documents an exclusive vocabulary bound."
+                    )
             if self.target_parallel_config.tensor_parallel_size != 1:
                 raise ValueError(
                     "method='uno' initially supports tensor parallel size 1"

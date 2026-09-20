@@ -3,6 +3,7 @@
 
 
 import torch
+import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from vllm import envs
@@ -86,6 +87,50 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         self.output_slices: tuple[int, ...]
         self.output_size: int
         self.n_slices: int
+        self.system_lora_slot: int | None = None
+
+    def set_system_lora_slot(self, slot: int) -> None:
+        """Use one pinned adapter as an independently gated system overlay."""
+        if self.tp_size != 1:
+            raise ValueError("system LoRA overlays currently require tensor parallel 1")
+        self.system_lora_slot = slot
+
+    def _apply_system_lora_overlay(
+        self, x: torch.Tensor, output: torch.Tensor
+    ) -> torch.Tensor:
+        slot = self.system_lora_slot
+        if slot is None or not is_forward_context_available():
+            return output
+        mask = get_forward_context().system_lora_mask
+        if mask is None:
+            return output
+
+        original_shape = output.shape
+        x_2d = x.flatten(0, 1) if x.ndim == 3 else x
+        output_2d = output.flatten(0, 1) if output.ndim == 3 else output
+        row_mask = mask[: x_2d.shape[0]].to(dtype=x_2d.dtype).reshape(-1, 1)
+        if row_mask.shape[0] != x_2d.shape[0]:
+            raise ValueError(
+                "system LoRA mask does not cover every linear input row: "
+                f"{row_mask.shape[0]} != {x_2d.shape[0]}"
+            )
+
+        output_offset = 0
+        for lora_a_slots, lora_b_slots, output_size in zip(
+            self.lora_a_stacked, self.lora_b_stacked, self.output_slices
+        ):
+            lora_a = lora_a_slots[slot, 0]
+            lora_b = lora_b_slots[slot, 0]
+            hidden = F.linear(x_2d, lora_a)
+            hidden.mul_(row_mask)
+            output_2d[:, output_offset : output_offset + output_size].addmm_(
+                hidden,
+                lora_b.t(),
+                beta=1.0,
+                alpha=1.0,
+            )
+            output_offset += output_size
+        return output_2d.reshape(original_shape)
 
     def _init_lora_stream_context(self) -> None:
         if not self._enable_aux_cuda_stream:
@@ -238,8 +283,7 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         # as some MM encoders cannot handle flattened inputs.
         if original_shape is not None:
             output = output.reshape(original_shape)
-
-        return output
+        return self._apply_system_lora_overlay(x, output)
 
     def _apply_async_impl(
         self, x: torch.Tensor, bias: torch.Tensor | None = None
@@ -303,8 +347,7 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         # as some MM encoders cannot handle flattened inputs.
         if original_shape is not None:
             output = output.reshape(original_shape)
-
-        return output
+        return self._apply_system_lora_overlay(x, output)
 
     @property
     def weight(self) -> torch.Tensor:

@@ -705,6 +705,105 @@ def test_set_adapter_mapping_refreshes_after_slot_reassignment(
 
 
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.skip_global_cleanup
+def test_reserved_adapter_survives_lru_churn_and_capture_cleanup(
+    default_vllm_config, dist_init, dummy_model, device
+):
+    model = dummy_model
+    adapters = [
+        create_lora(i, model, ["dense1", "dense2", "lm_head"], device=device)
+        for i in (1, 2, 3)
+    ]
+    manager = LRUCacheLoRAModelManager(
+        model,
+        2,
+        2,
+        2,
+        LoRAConfig(
+            max_lora_rank=8,
+            max_cpu_loras=3,
+            max_loras=2,
+            lora_dtype=DEFAULT_DTYPE,
+        ),
+        device=device,
+        vllm_config=default_vllm_config,
+    )
+    for adapter in adapters:
+        assert manager.add_adapter(adapter)
+
+    assert manager.activate_adapter(1)
+    reserved_slot = manager.lora_index_to_id.index(1)
+    assert manager.reserve_adapter(1)
+    assert manager.num_reserved_adapters == 1
+
+    assert manager.activate_adapter(2)
+    assert manager.activate_adapter(3)
+    assert manager.lora_index_to_id[reserved_slot] == 1
+
+    manager.remove_all_adapters(preserve_reserved=True)
+    assert set(manager.list_adapters()) == {1}
+    assert manager.lora_index_to_id[reserved_slot] == 1
+
+    manager.remove_all_adapters()
+    assert manager.num_reserved_adapters == 0
+    assert all(adapter_id is None for adapter_id in manager.lora_index_to_id)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.skip_global_cleanup
+def test_punica_metadata_banks_are_owner_isolated(
+    default_vllm_config, dist_init, dummy_model, device
+):
+    model = dummy_model
+    adapter = create_lora(
+        1, model, ["dense1", "dense2", "lm_head"], device=device
+    )
+    manager = LRUCacheLoRAModelManager(
+        model,
+        2,
+        4,
+        2,
+        LoRAConfig(
+            max_lora_rank=8,
+            max_cpu_loras=2,
+            max_loras=2,
+            lora_dtype=DEFAULT_DTYPE,
+        ),
+        device=device,
+        vllm_config=default_vllm_config,
+    )
+    assert manager.add_adapter(adapter)
+    assert manager.activate_adapter(1)
+    wrapper = manager.punica_wrapper_mapping[DEFAULT_LANGUAGE_WRAPPER_KEY]
+
+    target_mapping = LoRAMapping((1, 0, 1, 0), (1, 0))
+    manager.set_adapter_mapping(target_mapping, metadata_bank="target")
+    target_values = wrapper.token_lora_indices.clone()
+    staging_ptr = wrapper._token_lora_indices.data_ptr()
+
+    uno_mapping = LoRAMapping((0, 1, 1, 1), (0, 1))
+    # Runtime discovery commonly occurs inside a model inference-mode dummy
+    # run. The new bank must still accept later in-place metadata refreshes.
+    with torch.inference_mode():
+        manager.set_adapter_mapping(uno_mapping, metadata_bank="uno")
+    assert wrapper.active_metadata_bank == "uno"
+    assert not wrapper._token_lora_indices.is_inference()
+    assert wrapper._token_lora_indices.data_ptr() == staging_ptr
+    assert not torch.equal(wrapper.token_lora_indices, target_values)
+
+    # Re-selecting an unchanged target mapping must still restore the target
+    # bank even when its metadata update is elided.
+    manager.set_adapter_mapping(target_mapping, metadata_bank="target")
+    assert wrapper.active_metadata_bank == "target"
+    assert wrapper._token_lora_indices.data_ptr() == staging_ptr
+    assert torch.equal(wrapper.token_lora_indices, target_values)
+
+    refreshed_uno_mapping = LoRAMapping((1, 1, 0, 0), (1, 0))
+    manager.set_adapter_mapping(refreshed_uno_mapping, metadata_bank="uno")
+    assert wrapper.active_metadata_bank == "uno"
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_lru_cache_worker_adapter_manager(dist_init, dummy_model, device, tmp_path):
     lora_config = LoRAConfig(
         max_lora_rank=8, max_cpu_loras=4, max_loras=4, lora_dtype=DEFAULT_DTYPE

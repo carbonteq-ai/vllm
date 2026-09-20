@@ -61,6 +61,7 @@ class LoRAModelRunnerMixin:
         token_lora_mapping: tuple[int, ...],
         lora_requests: set[LoRARequest],
         mapping_type: LoRAMappingType = LoRAMappingType.LANGUAGE,
+        metadata_bank: str = "target",
     ) -> None:
         self._ensure_lora_enabled()
 
@@ -74,7 +75,9 @@ class LoRAModelRunnerMixin:
             is_prefill=True,
             type=mapping_type,
         )
-        self.lora_manager.set_active_adapters(lora_requests, lora_mapping)
+        self.lora_manager.set_active_adapters(
+            lora_requests, lora_mapping, metadata_bank
+        )
 
     def _ensure_lora_enabled(self) -> None:
         if not hasattr(self, "lora_manager"):
@@ -110,7 +113,11 @@ class LoRAModelRunnerMixin:
             # __enter__ code
             assert self.lora_manager is not None, "LoRA is not enabled"
 
-            num_loras = lora_config.max_loras
+            num_loras = (
+                lora_config.max_loras - self.lora_manager.num_reserved_adapters
+            )
+            if num_loras < 0:
+                raise ValueError("Reserved LoRAs exceed configured GPU LoRA slots")
             lora_warmup_rank: int = (
                 lora_config.max_lora_rank if lora_config.max_lora_rank < 8 else 8
             )
@@ -171,7 +178,9 @@ class LoRAModelRunnerMixin:
             assert self.lora_manager is not None, "LoRA is not enabled"
 
             num_reqs = len(num_scheduled_tokens)
-            max_loras = lora_config.max_loras
+            max_loras = (
+                lora_config.max_loras - self.lora_manager.num_reserved_adapters
+            )
 
             # Determine how many distinct LoRAs to use and whether to include
             # no-LoRA tokens (-1 entries).
@@ -281,7 +290,7 @@ class LoRAModelRunnerMixin:
     def maybe_remove_all_loras(self, lora_config: LoRAConfig | None):
         if lora_config is None:
             return
-        self.lora_manager.remove_all_adapters()
+        self.lora_manager.remove_all_adapters(preserve_reserved=True)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         self._ensure_lora_enabled()
@@ -294,6 +303,14 @@ class LoRAModelRunnerMixin:
     def pin_lora(self, lora_id: int) -> bool:
         self._ensure_lora_enabled()
         return self.lora_manager.pin_adapter(lora_id)
+
+    def reserve_lora(self, lora_id: int) -> bool:
+        self._ensure_lora_enabled()
+        return self.lora_manager.reserve_adapter(lora_id)
+
+    def enable_system_lora_overlay(self, lora_id: int) -> int:
+        self._ensure_lora_enabled()
+        return self.lora_manager.enable_system_overlay(lora_id)
 
     def list_loras(self) -> set[int]:
         self._ensure_lora_enabled()

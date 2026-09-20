@@ -70,6 +70,65 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             device=device,
             captured_lora_counts=captured_lora_counts,
         )
+        self._kernel_metadata_banks: dict[
+            str, tuple[LoRAKernelMeta, LoRAKernelMeta]
+        ] = {}
+        self.create_metadata_bank("target")
+
+    def create_metadata_bank(self, name: str) -> None:
+        super().create_metadata_bank(name)
+        if name in self._kernel_metadata_banks:
+            return
+        captured_lora_counts = get_captured_lora_counts(
+            self.max_loras, self.lora_config.specialize_active_lora
+        )
+        max_num_tokens = self._token_lora_indices.numel()
+        # See the base-bank allocation: these objects contain tensors that are
+        # refreshed between graph replays even when first requested by an
+        # inference-mode warmup.
+        with torch.inference_mode(False):
+            self._kernel_metadata_banks[name] = (
+                LoRAKernelMeta.make(
+                    self.max_loras,
+                    max_num_tokens,
+                    device=self.device,
+                    captured_lora_counts=captured_lora_counts,
+                ),
+                LoRAKernelMeta.make(
+                    self.max_loras,
+                    max_num_tokens,
+                    device=self.device,
+                    captured_lora_counts=captured_lora_counts,
+                ),
+            )
+
+    def activate_metadata_bank(self, name: str) -> None:
+        self.create_metadata_bank(name)
+        if name == self._active_metadata_bank:
+            return
+        current_token, current_prompt = self._kernel_metadata_banks[
+            self._active_metadata_bank
+        ]
+        selected_token, selected_prompt = self._kernel_metadata_banks[name]
+        self._copy_kernel_meta(self.token_mapping_meta, current_token)
+        self._copy_kernel_meta(self.prompt_mapping_meta, current_prompt)
+        super().activate_metadata_bank(name)
+        self._copy_kernel_meta(selected_token, self.token_mapping_meta)
+        self._copy_kernel_meta(selected_prompt, self.prompt_mapping_meta)
+
+    @staticmethod
+    def _copy_kernel_meta(source: LoRAKernelMeta, target: LoRAKernelMeta) -> None:
+        for attribute in (
+            "token_lora_mapping",
+            "token_indices_sorted_by_lora_ids",
+            "active_lora_ids",
+            "num_tokens_per_lora",
+            "lora_token_start_loc",
+            "no_lora_flag_cpu",
+            "num_active_loras_cpu",
+            "default_num_active_loras_cpu",
+        ):
+            getattr(target, attribute).copy_(getattr(source, attribute))
 
     def update_metadata(
         self,

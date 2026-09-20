@@ -159,6 +159,102 @@ class PunicaWrapperBase(PunicaWrapperABC):
         self.batch_size: int = -1
         self.is_prefill = False
         self.no_lora = False
+        self._base_metadata_banks: dict[str, dict[str, object]] = {}
+        self._active_metadata_bank = "target"
+        PunicaWrapperBase.create_metadata_bank(self, "target")
+
+    def _current_base_metadata_bank(self) -> dict[str, object]:
+        return {
+            "_token_lora_indices": self._token_lora_indices,
+            "_sampler_indices": self._sampler_indices,
+            "_sampler_indices_padded": self._sampler_indices_padded,
+            "_embeddings_indices": self._embeddings_indices,
+            "indices_len": self.indices_len,
+            "_seq_start_locs": self._seq_start_locs,
+            "_seq_lengths": self._seq_lengths,
+            "_lora_indices_per_batch": self._lora_indices_per_batch,
+            "max_length": self.max_length,
+            "token_nums": self.token_nums,
+            "batch_size": self.batch_size,
+            "is_prefill": self.is_prefill,
+            "no_lora": self.no_lora,
+        }
+
+    def create_metadata_bank(self, name: str) -> None:
+        if name in self._base_metadata_banks:
+            return
+        # Banks can be discovered lazily from an inference-mode dummy run.
+        # Their tensors remain mutable runtime inputs, so they must not inherit
+        # inference-tensor semantics from the caller.
+        with torch.inference_mode(False):
+            self._base_metadata_banks[name] = {
+                "_token_lora_indices": torch.empty_like(self._token_lora_indices),
+                "_sampler_indices": torch.empty_like(self._sampler_indices),
+                "_sampler_indices_padded": torch.empty_like(
+                    self._sampler_indices_padded
+                ),
+                "_embeddings_indices": torch.empty_like(self._embeddings_indices),
+                "indices_len": [None] * 4,
+                "_seq_start_locs": torch.empty_like(self._seq_start_locs),
+                "_seq_lengths": torch.empty_like(self._seq_lengths),
+                "_lora_indices_per_batch": torch.empty_like(
+                    self._lora_indices_per_batch
+                ),
+                "max_length": 0,
+                "token_nums": 0,
+                "batch_size": -1,
+                "is_prefill": False,
+                "no_lora": False,
+            }
+
+    def activate_metadata_bank(self, name: str) -> None:
+        self.create_metadata_bank(name)
+        if name == self._active_metadata_bank:
+            return
+
+        # torch.compile binds these staging tensor addresses into the model.
+        # Preserve them and move owner state by value; swapping Python tensor
+        # attributes leaves compiled graphs reading the original bank.
+        current = self._base_metadata_banks[self._active_metadata_bank]
+        selected = self._base_metadata_banks[name]
+        tensor_attributes = (
+            "_token_lora_indices",
+            "_sampler_indices",
+            "_sampler_indices_padded",
+            "_embeddings_indices",
+            "_seq_start_locs",
+            "_seq_lengths",
+            "_lora_indices_per_batch",
+        )
+        for attribute in tensor_attributes:
+            staging = getattr(self, attribute)
+            current_value = current[attribute]
+            selected_value = selected[attribute]
+            assert isinstance(current_value, torch.Tensor)
+            assert isinstance(selected_value, torch.Tensor)
+            current_value.copy_(staging)
+            staging.copy_(selected_value)
+
+        current_indices_len = current["indices_len"]
+        selected_indices_len = selected["indices_len"]
+        assert isinstance(current_indices_len, list)
+        assert isinstance(selected_indices_len, list)
+        current_indices_len[:] = self.indices_len
+        self.indices_len[:] = selected_indices_len
+        for attribute in (
+            "max_length",
+            "token_nums",
+            "batch_size",
+            "is_prefill",
+            "no_lora",
+        ):
+            current[attribute] = getattr(self, attribute)
+            setattr(self, attribute, selected[attribute])
+        self._active_metadata_bank = name
+
+    @property
+    def active_metadata_bank(self) -> str:
+        return self._active_metadata_bank
 
     def _update_base_metadata(
         self,

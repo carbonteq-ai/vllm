@@ -3,42 +3,28 @@
 
 import torch
 
-from vllm.v1.spec_decode.uno import UNO_DRAFT_ADAPTER_ID, UnoProposer
+from vllm.v1.spec_decode.uno import UnoProposer
 
 
-def test_uno_lora_mapping_gates_only_noise_positions() -> None:
-    noise_mask = torch.tensor([False, True, True, False, True])
-    sample_indices = torch.tensor([0, 1, 4], dtype=torch.int32)
-
-    prompt_mapping, token_mapping = UnoProposer._build_lora_mappings(
-        noise_mask,
-        sample_indices,
-        adapter_id=17,
+def test_uno_system_overlay_mask_is_limited_to_active_rows() -> None:
+    proposer = object.__new__(UnoProposer)
+    proposer.is_masked_token_mask = torch.tensor(
+        [False, True, True, False, True, True]
     )
 
-    assert token_mapping == (0, 17, 17, 0, 17)
-    assert prompt_mapping == (0, 17, 17)
+    active = proposer._system_lora_mask(3)
+
+    assert active is not None
+    assert torch.equal(active, torch.tensor([False, True, True]))
 
 
-def test_uno_composite_mapping_keeps_policy_on_seed_rows() -> None:
-    noise_mask = torch.tensor([False, True, True, False, True, True])
-    sample_indices = torch.arange(6, dtype=torch.int32)
-    policy_ids = torch.tensor([11, 12])
+def test_uno_system_overlay_mask_reuses_persistent_storage() -> None:
+    proposer = object.__new__(UnoProposer)
+    proposer.is_masked_token_mask = torch.tensor([False, True, True, False])
 
-    prompt_mapping, token_mapping = UnoProposer._build_composite_lora_mappings(
-        noise_mask,
-        sample_indices,
-        policy_ids,
-        num_speculative_tokens=3,
+    active = proposer._system_lora_mask(3)
+
+    assert active is not None
+    assert active.untyped_storage().data_ptr() == (
+        proposer.is_masked_token_mask.untyped_storage().data_ptr()
     )
-
-    expected = (
-        11,
-        UNO_DRAFT_ADAPTER_ID,
-        UNO_DRAFT_ADAPTER_ID,
-        12,
-        UNO_DRAFT_ADAPTER_ID,
-        UNO_DRAFT_ADAPTER_ID,
-    )
-    assert token_mapping == expected
-    assert prompt_mapping == expected
