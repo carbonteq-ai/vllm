@@ -116,6 +116,17 @@ def _resolve_gdn_prefill_backend(
     )
     backend = str(backend_cfg).strip().lower()
 
+    if envs.VLLM_BATCH_INVARIANT:
+        # The FlashInfer and CuteDSL prefill kernels change a request's output
+        # and final recurrent state with batch composition; the Triton/FLA path
+        # is bit-exact across it (measured on Qwen3.5-2B, SM120).
+        if backend in ("flashinfer", "cutedsl"):
+            raise ValueError(
+                f"gdn_prefill_backend={backend!r} is not batch-invariant; "
+                "use 'auto' or 'triton' with VLLM_BATCH_INVARIANT=1."
+            )
+        return backend, "triton"
+
     if not current_platform.is_cuda():
         return backend, "triton"
 
@@ -368,6 +379,10 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+    # Validated with the Triton/FLA prefill kernel that batch-invariant mode
+    # selects. The spec-decode MTP kernel is not covered by that validation.
+    batch_invariance_validated = True
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -505,6 +520,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and vllm_config.scheduler_config.enable_chunked_prefill
+        ):
+            # Where the scheduler splits a prompt changes the chunked delta-rule
+            # arithmetic, so a request's logprobs can still depend on what
+            # shared its prefill steps. Unsplit prompts are bit-exact.
+            logger.warning_once(
+                "Batch-invariant GDN is exact across batch size and mixed "
+                "prefill/decode steps, but not across prompt split points. "
+                "Disable chunked prefill (with max_num_batched_tokens >= the "
+                "longest prompt) for fully reproducible logprobs."
+            )
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
@@ -1487,7 +1515,31 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process non-spec-decode part
-        if split_non_spec:
+        if split_non_spec and envs.VLLM_BATCH_INVARIANT:
+            # A decode token must take the same recurrence kernel whether or
+            # not a prefill shares its step; pure-decode steps use the packed
+            # kernel, whose results the sigmoid-fused kernel does not match.
+            num_v_heads = self.num_v_heads // self.tp_size
+            decode_out = core_attn_out.new_empty(
+                (num_decode_tokens, 1, num_v_heads, self.head_v_dim)
+            )
+            assert mixed_qkv_non_spec is not None
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv=mixed_qkv_non_spec[:num_decode_tokens].contiguous(),
+                a=a[:num_decode_tokens],
+                b=b[:num_decode_tokens],
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                scale=self.head_k_dim**-0.5,
+                initial_state=ssm_state,
+                out=decode_out,
+                ssm_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+                    : attn_metadata.num_decodes
+                ],
+                use_qk_l2norm_in_kernel=True,
+            )
+            core_attn_out_decode = decode_out.squeeze(1).unsqueeze(0)
+        elif split_non_spec:
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
             )

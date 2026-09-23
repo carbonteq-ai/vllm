@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.configuration_utils import PretrainedConfig
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -634,6 +635,13 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
         num_speculative_tokens: int = 0,
     ) -> None:
         super().__init__()
+        if envs.VLLM_BATCH_INVARIANT:
+            # Shares the GDN backend, whose invariance is validated per layer.
+            raise RuntimeError(
+                "VLLM batch_invariant mode is not supported for "
+                "BailingMoeV3KimiDeltaAttention: its kernels have not been "
+                "validated as batch-invariant."
+            )
         self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = config.hidden_size
         self.head_dim = config.head_dim

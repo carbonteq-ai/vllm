@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+import vllm.envs as envs
 from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonPointerInputVariant,
@@ -177,6 +178,11 @@ def layer_norm_fwd_kernel(
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
+    if envs.VLLM_BATCH_INVARIANT:
+        # Multi-row tiles reduce each row's sum of squares in a different
+        # order (22% of rows change rstd on SM120), so the row count must not
+        # choose the tile.
+        return 1
     sm_count = num_compute_units(device.index)
     rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
     rows_per_block = min(rows_per_block, 4)

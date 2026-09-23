@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import ClassVar
+
 import torch
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
 )
@@ -22,6 +25,10 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 class GatedDeltaNetAttention(PluggableLayer, MambaBase):
     """Base class for GatedDeltaNet attention layer."""
 
+    # Set only after measuring bit-exact per-request logprobs across batch
+    # composition; kernels differ between GDN families.
+    batch_invariance_validated: ClassVar[bool] = False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -29,6 +36,12 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if envs.VLLM_BATCH_INVARIANT and not self.batch_invariance_validated:
+            raise RuntimeError(
+                "VLLM batch_invariant mode is not supported for "
+                f"{type(self).__name__}: its GDN kernels have not been "
+                "validated as batch-invariant."
+            )
         self.prefix = prefix
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()

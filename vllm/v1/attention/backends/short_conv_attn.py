@@ -37,6 +37,16 @@ class ShortConvAttentionBackend(AttentionBackend):
     def is_ssm(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        # causal_conv1d_fn/causal_conv1d_update convolve each sequence
+        # independently with no cross-batch reduction, and the surrounding
+        # projections take the batch-invariant linear path. Measured on
+        # LFM2.5-2.6B: bit-exact logprobs across batch sizes, prefill chunks
+        # sharing steps with decode, and different prefill chunk boundaries.
+        # The speculative-decode conv update path is not yet covered.
+        return True
+
 
 @dataclass
 class ShortConvAttentionMetadata(BaseMambaAttentionMetadata):

@@ -37,6 +37,13 @@ class GDNAttentionBackend(AttentionBackend):
     def is_ssm(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        # Several layer families share this backend with different kernels, so
+        # each GatedDeltaNetAttention subclass must separately declare that it
+        # was validated; unvalidated layers refuse batch-invariant mode.
+        return True
+
 
 @dataclass
 class GDNAttentionMetadata:
