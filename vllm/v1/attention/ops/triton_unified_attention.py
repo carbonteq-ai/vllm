@@ -24,14 +24,82 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     find_seq_idx,
     init_softmax_M,
     load_qq_bias_tile,
+    merge_softmax_segment,
     resolve_seq_and_query_len,
     softmax_step,
+    softmax_step_keep_empty,
     store_segm_reduce_scalars,
 )
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
+
+# Batch-invariant split-KV. Keys are cut into fixed segments of
+# ``segment_len`` tokens at absolute positions, and every query row reduces
+# its segments in order with ``merge_softmax_segment``. The 2D kernel does
+# that inline and the 3D kernel spreads the segments over
+# ``INVARIANT_SEGMENT_PROGRAMS`` programs before ``reduce_segments`` folds
+# them, so both paths return identical bits. The 2D/3D choice can then
+# follow batch size, as it does outside invariant mode.
+INVARIANT_SEGMENT_PROGRAMS = 16
+INVARIANT_MIN_SEGMENT_LEN = 128
+INVARIANT_MAX_SEGMENTS = 256
+
+
+def batch_invariant_segment_len(max_model_len: int) -> int:
+    """Segment length for invariant split-KV, fixed per engine config."""
+    seg_len = INVARIANT_MIN_SEGMENT_LEN
+    while seg_len * INVARIANT_MAX_SEGMENTS < max_model_len:
+        seg_len *= 2
+    return seg_len
+
+
+@triton.jit
+def _store_fixed_segment(
+    segm_output_ptr,
+    segm_max_ptr,
+    segm_expsum_ptr,
+    seg,
+    M,
+    L,
+    acc,
+    query_offset_0,
+    query_offset_1,
+    query_mask_0,
+    query_mask_1,
+    dim_mask,
+    num_query_heads: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    segm_output_offset = (
+        query_offset_0[:, None].to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + seg * HEAD_SIZE_PADDED
+        + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+    )
+    tl.store(
+        segm_output_ptr + segm_output_offset,
+        acc,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+    )
+    store_segm_reduce_scalars(
+        segm_max_ptr,
+        segm_expsum_ptr,
+        query_offset_0,
+        query_offset_1,
+        seg,
+        M,
+        L,
+        query_mask_0,
+        query_mask_1,
+        num_query_heads,
+        NUM_SEGMENTS_PER_SEQ,
+    )
+
+
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
@@ -289,12 +357,25 @@ def kernel_unified_attention(
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    # Batch-invariant split-KV (see ``INVARIANT_SEGMENT_PROGRAMS``). 0 keeps
+    # the default behaviour. Otherwise KV is cut into segments of this many
+    # tiles; 2D merges them inline, 3D writes one partial per segment, with
+    # ``SEG_PROGRAMS`` programs each covering a contiguous run of segments.
+    FIXED_SEG_TILES: tl.constexpr = 0,
+    SEG_PROGRAMS: tl.constexpr = 1,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
         KV_QUANT_MODE <= 3
     )
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
+    # Fixed segments start empty; the sink seeds the running total instead.
+    SEGMENT_SINKS: tl.constexpr = USE_SINKS and FIXED_SEG_TILES == 0
+    # A tile loop crosses segment boundaries in 2D, and in 3D only when a
+    # program covers more than one segment.
+    CROSSES_SEGMENTS: tl.constexpr = FIXED_SEG_TILES > 0 and (
+        (not IS_3D) or SEG_PROGRAMS < NUM_SEGMENTS_PER_SEQ
+    )
 
     if USE_TD:
         tl.static_assert(
@@ -320,9 +401,16 @@ def kernel_unified_attention(
         return
 
     if IS_3D:
-        tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
-        if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
-            return
+        if FIXED_SEG_TILES > 0:
+            num_fixed_segs = cdiv_fn(seq_len, FIXED_SEG_TILES * TILE_SIZE)
+            segs_per_program = cdiv_fn(num_fixed_segs, SEG_PROGRAMS)
+            if segm_idx * segs_per_program >= num_fixed_segs:
+                return
+            tiles_per_segment = segs_per_program * FIXED_SEG_TILES
+        else:
+            tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
+            if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+                return
     else:
         tiles_per_segment = 0
 
@@ -375,11 +463,18 @@ def kernel_unified_attention(
     block_table_offset = seq_idx * block_table_stride
 
     M = init_softmax_M(
-        sink_ptr, query_offset_1, query_mask_1, segm_idx, BLOCK_M, USE_SINKS, IS_3D
+        sink_ptr, query_offset_1, query_mask_1, segm_idx, BLOCK_M, SEGMENT_SINKS, IS_3D
     )
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     # acc : (BLOCK_M, HEAD_SIZE_PADDED)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+    if FIXED_SEG_TILES > 0 and not IS_3D:
+        # Running total over fixed segments; reduce_segments seeds it the same.
+        M_tot = init_softmax_M(
+            sink_ptr, query_offset_1, query_mask_1, 0, BLOCK_M, USE_SINKS, False
+        )
+        L_tot = tl.where(M_tot > float("-inf"), 1.0, 0.0)
+        acc_tot = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
     score_scale = scale
     value_scale = 1.0
     if USE_FP8_Q_DESCALE:
@@ -421,10 +516,86 @@ def kernel_unified_attention(
         seq_idx,
     )
 
+    if FIXED_SEG_TILES > 0 and IS_3D:
+        # Segments of this program before the window start are never visited;
+        # mark them empty so reduce_segments skips them.
+        first_seg = segm_idx * segs_per_program
+        first_visited = tl.where(
+            loop_lo < loop_hi,
+            loop_lo // FIXED_SEG_TILES,
+            tl.minimum(first_seg + segs_per_program, num_fixed_segs),
+        )
+        for seg in range(first_seg, first_visited):
+            store_segm_reduce_scalars(
+                segm_max_ptr,
+                segm_expsum_ptr,
+                query_offset_0,
+                query_offset_1,
+                seg,
+                tl.full([BLOCK_M], float("-inf"), dtype=tl.float32),
+                L,
+                query_mask_0,
+                query_mask_1,
+                num_query_heads,
+                NUM_SEGMENTS_PER_SEQ,
+            )
+
     # iterate through tiles (now limited to the sliding window range)
     for j in range(loop_lo, loop_hi):
+        # Constexpr outer branch, runtime inner one: keep them separate.
+        if CROSSES_SEGMENTS:  # noqa: SIM102
+            if (j % FIXED_SEG_TILES == 0) and (j > loop_lo):
+                if USE_FP8_Q_DESCALE:
+                    acc *= value_scale
+                if IS_3D:
+                    _store_fixed_segment(
+                        segm_output_ptr,
+                        segm_max_ptr,
+                        segm_expsum_ptr,
+                        j // FIXED_SEG_TILES - 1,
+                        M,
+                        L,
+                        acc,
+                        query_offset_0,
+                        query_offset_1,
+                        query_mask_0,
+                        query_mask_1,
+                        dim_mask,
+                        num_query_heads,
+                        NUM_SEGMENTS_PER_SEQ,
+                        HEAD_SIZE_PADDED,
+                    )
+                else:
+                    M_tot, L_tot, acc_tot = merge_softmax_segment(
+                        M_tot, L_tot, acc_tot, M, L, acc
+                    )
+                M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+                L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+                acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
+
+        # Zero V outside the window: keys the q-block's first row cannot see
+        # may sit in freed blocks. Folding this key-only mask into the V load
+        # avoids a register round trip that costs a V tile of shared memory
+        # (head 512 overflowed SM120); the values are unchanged.
+        if SLIDING_WINDOW:
+            qpos_lo = q_block_local_idx * BLOCK_Q
+            dist = context_len + qpos_lo - seq_offset[:, None]
+            if USE_PER_SEQ_CAUSAL:
+                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
+                sw_mask_v = tl.where(
+                    is_causal_seq,
+                    dist < SLIDING_WINDOW,
+                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+                )
+            elif USE_CAUSAL:
+                sw_mask_v = dist < SLIDING_WINDOW
+            else:
+                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
+            v_load_mask = dim_mask[None, :] & tile_mask[:, None] & sw_mask_v
+        else:
+            v_load_mask = dim_mask[None, :] & tile_mask[:, None]
 
         physical_block_idx = tl.load(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
@@ -491,11 +662,14 @@ def kernel_unified_attention(
             # V : (TILE_SIZE, HEAD_SIZE)
             V_load = tl.load(
                 value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
+                mask=v_load_mask,
                 other=0.0,
             )
         K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+        if SLIDING_WINDOW and USE_TD:
+            # Descriptor loads cannot take the mask.
+            V = tl.where(sw_mask_v, V, 0.0)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
         if USE_PER_TOKEN_HEAD_SCALES:
@@ -563,24 +737,12 @@ def kernel_unified_attention(
                 qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
             )
 
-        M, L, P, alpha = softmax_step(S, M, L)
+        if FIXED_SEG_TILES > 0:
+            M, L, P, alpha = softmax_step_keep_empty(S, M, L)
+        else:
+            M, L, P, alpha = softmax_step(S, M, L)
         acc = acc * alpha[:, None]
 
-        if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
-            dist = context_len + qpos_lo - seq_offset[:, None]
-            if USE_PER_SEQ_CAUSAL:
-                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
-                sw_mask_v = tl.where(
-                    is_causal_seq,
-                    dist < SLIDING_WINDOW,
-                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
-                )
-            elif USE_CAUSAL:
-                sw_mask_v = dist < SLIDING_WINDOW
-            else:
-                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
-            V = tl.where(sw_mask_v, V, 0.0)
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
@@ -589,7 +751,28 @@ def kernel_unified_attention(
             acc += tl.dot(P.to(V.dtype), V)
 
     # ---- Epilogue ---------------------------------------------------------
-    if IS_3D:
+    if FIXED_SEG_TILES > 0 and IS_3D:
+        if loop_lo < loop_hi:
+            if USE_FP8_Q_DESCALE:
+                acc *= value_scale
+            _store_fixed_segment(
+                segm_output_ptr,
+                segm_max_ptr,
+                segm_expsum_ptr,
+                (loop_hi - 1) // FIXED_SEG_TILES,
+                M,
+                L,
+                acc,
+                query_offset_0,
+                query_offset_1,
+                query_mask_0,
+                query_mask_1,
+                dim_mask,
+                num_query_heads,
+                NUM_SEGMENTS_PER_SEQ,
+                HEAD_SIZE_PADDED,
+            )
+    elif IS_3D:
         if USE_FP8_Q_DESCALE:
             acc *= value_scale
         # Store per-segment partials; finalized by ``reduce_segments``.
@@ -646,9 +829,17 @@ def kernel_unified_attention(
             NUM_SEGMENTS_PER_SEQ,
         )
     else:
-        acc = acc / L[:, None]
-        if USE_FP8_Q_DESCALE:
-            acc *= value_scale
+        if FIXED_SEG_TILES > 0:
+            if USE_FP8_Q_DESCALE:
+                acc *= value_scale
+            M_tot, L_tot, acc_tot = merge_softmax_segment(
+                M_tot, L_tot, acc_tot, M, L, acc
+            )
+            acc = tl.where(L_tot[:, None] == 0.0, 0.0, acc_tot / L_tot[:, None])
+        else:
+            acc = acc / L[:, None]
+            if USE_FP8_Q_DESCALE:
+                acc *= value_scale
         if USE_FP8:
             acc = acc * tl.load(out_scale)
             acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
@@ -687,6 +878,57 @@ def kernel_unified_attention(
 
 
 @triton.jit
+def _reduce_fixed_segments(
+    segm_output_ptr,
+    segm_max_ptr,
+    segm_expsum_ptr,
+    sink_ptr,
+    query_token_idx,
+    query_head_idx,
+    seq_len,
+    dim_mask,
+    num_query_heads: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    FIXED_SEG_TILES: tl.constexpr,
+    USE_SINKS: tl.constexpr,
+):
+    """Fold fixed segments in order, exactly as the 2D kernel does inline."""
+    head_offset = tl.zeros([1], dtype=tl.int32) + query_head_idx
+    M_tot = tl.full([1], float("-inf"), dtype=tl.float32)
+    if USE_SINKS:
+        M_tot = tl.load(sink_ptr + head_offset).to(tl.float32)
+    L_tot = tl.where(M_tot > float("-inf"), 1.0, 0.0)
+    acc_tot = tl.zeros([1, HEAD_SIZE_PADDED], dtype=tl.float32)
+
+    scalar_base = (
+        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + head_offset * NUM_SEGMENTS_PER_SEQ
+    )
+    output_base = (
+        query_token_idx.to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+    )
+    num_segs = cdiv_fn(seq_len, FIXED_SEG_TILES * TILE_SIZE)
+    for seg in range(0, num_segs):
+        M_seg = tl.load(segm_max_ptr + scalar_base + seg)
+        L_seg = tl.load(segm_expsum_ptr + scalar_base + seg)
+        acc_seg = tl.load(
+            segm_output_ptr + output_base + seg * HEAD_SIZE_PADDED,
+            mask=dim_mask[None, :],
+            other=0.0,
+        )
+        M_tot, L_tot, acc_tot = merge_softmax_segment(
+            M_tot, L_tot, acc_tot, M_seg, L_seg, acc_seg
+        )
+    acc = tl.where(L_tot[:, None] == 0.0, 0.0, acc_tot / L_tot[:, None])
+    return tl.reshape(acc, [HEAD_SIZE_PADDED])
+
+
+@triton.jit
 def reduce_segments(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     segm_output_ptr,
@@ -709,6 +951,11 @@ def reduce_segments(
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    # Batch-invariant split-KV: fold fixed segments in order (see
+    # ``INVARIANT_SEGMENT_PROGRAMS``); the sink seeds the running total.
+    FIXED_SEG_TILES: tl.constexpr = 0,
+    USE_SINKS: tl.constexpr = False,
+    sink_ptr=None,
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -720,48 +967,68 @@ def reduce_segments(
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
 
-    # number of segments for this particular sequence
-    num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
-
-    # create masks for subsequent loads
-    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
-    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
-        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
-    )
     dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1, 0).to(tl.int1)
+    if FIXED_SEG_TILES > 0:
+        acc = _reduce_fixed_segments(
+            segm_output_ptr,
+            segm_max_ptr,
+            segm_expsum_ptr,
+            sink_ptr,
+            query_token_idx,
+            query_head_idx,
+            seq_len,
+            dim_mask,
+            num_query_heads,
+            TILE_SIZE,
+            HEAD_SIZE_PADDED,
+            NUM_SEGMENTS_PER_SEQ,
+            FIXED_SEG_TILES,
+            USE_SINKS,
+        )
+    else:
+        # number of segments for this particular sequence
+        num_segments = NUM_SEGMENTS_PER_SEQ
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
 
-    # load segment maxima
-    segm_offset = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
-    )
-    segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
-    overall_max = tl.max(segm_max)
+        # create masks for subsequent loads
+        act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+        segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
+            [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
+        )
 
-    # load and rescale segment exp sums
-    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
-    overall_expsum = tl.sum(segm_expsum)
+        # load segment maxima
+        segm_offset = (
+            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_head_idx * NUM_SEGMENTS_PER_SEQ
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        )
+        segm_max = tl.load(
+            segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
+        )
+        overall_max = tl.max(segm_max)
 
-    # load, rescale, and add segment attention outputs
-    segm_output_offset = (
-        query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
-        + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
-    )
-    segm_output = tl.load(
-        segm_output_ptr + segm_output_offset,
-        mask=segm_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
-    segm_output *= tl.exp(segm_max - overall_max)[:, None]
-    acc_sum = tl.sum(segm_output, axis=0)
-    # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
-    acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+        # load and rescale segment exp sums
+        segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+        segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
+        overall_expsum = tl.sum(segm_expsum)
+
+        # load, rescale, and add segment attention outputs
+        segm_output_offset = (
+            query_token_idx.to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+            + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
+            + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+        )
+        segm_output = tl.load(
+            segm_output_ptr + segm_output_offset,
+            mask=segm_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
+        segm_output *= tl.exp(segm_max - overall_max)[:, None]
+        acc_sum = tl.sum(segm_output, axis=0)
+        # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
+        acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
     if USE_FP8:
         acc = acc * tl.load(out_scale_inv)
@@ -852,6 +1119,10 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    # Batch-invariant split-KV segment length in tokens (see
+    # ``batch_invariant_segment_len``). None keeps invariant mode on the
+    # single-pass 2D kernel.
+    invariant_segment_len: int | None = None,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -1038,11 +1309,30 @@ def unified_attention(
             f"(out.stride(1) = {out.stride(1)} != head_size = {head_size})."
         )
 
+    # Batch invariance cuts KV into fixed segments that both kernels reduce
+    # identically, so the 2D/3D choice below may still follow batch size.
+    fixed_seg_tiles = 0
+    if (
+        is_batch_invariant
+        and invariant_segment_len is not None
+        and not use_td
+        and invariant_segment_len % TILE_SIZE_PREFILL == 0
+    ):
+        fixed_seg_tiles = invariant_segment_len // TILE_SIZE_PREFILL
+    fixed_segments_fit = (
+        fixed_seg_tiles > 0
+        and softmax_segm_output is not None
+        and num_par_softmax_segments is not None
+        and num_par_softmax_segments * invariant_segment_len >= max_seqlen_k
+        and q.shape[0] * num_query_heads * num_par_softmax_segments * head_size_padded
+        <= softmax_segm_output.numel()
+    )
+
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
     # 2. The batch includes at least one prefill request, or
     # 3. The number of sequences exceeds the configured threshold, or
-    # 4. Batch invariance is enabled
+    # 4. Batch invariance is enabled without fixed segments that fit the buffers
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
@@ -1051,7 +1341,7 @@ def unified_attention(
         or softmax_segm_expsum is None
         or max_seqlen_q > 1
         or num_seqs > seq_threshold_3D
-        or is_batch_invariant
+        or (is_batch_invariant and not fixed_segments_fit)
     )
 
     # The kernel signature is the same for 2D and 3D — only the launch
@@ -1079,8 +1369,20 @@ def unified_attention(
     num_segments = num_par_softmax_segments if use_3d else 1
 
     grid: tuple[Any, ...]
+    seg_programs = 1
     if not use_3d:
         grid = (total_num_q_blocks, num_kv_heads)
+        tile_size = TILE_SIZE_PREFILL
+    elif fixed_seg_tiles > 0:
+        # Same tile size as 2D: segment partials must match bit for bit.
+        # Head 512 cannot also stage a segment store inside the tile loop
+        # within SM120 shared memory, so it gets one program per segment.
+        seg_programs = (
+            num_par_softmax_segments
+            if head_size_padded >= 512
+            else INVARIANT_SEGMENT_PROGRAMS
+        )
+        grid = (total_num_q_blocks, num_kv_heads, seg_programs)
         tile_size = TILE_SIZE_PREFILL
     else:
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
@@ -1168,6 +1470,8 @@ def unified_attention(
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
+        FIXED_SEG_TILES=fixed_seg_tiles,
+        SEG_PROGRAMS=seg_programs,
         **launch_kwargs,
     )
 
@@ -1184,11 +1488,14 @@ def unified_attention(
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
-            TILE_SIZE=TILE_SIZE_DECODE,
+            TILE_SIZE=tile_size,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=head_size_padded,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
+            FIXED_SEG_TILES=fixed_seg_tiles,
+            USE_SINKS=(sinks is not None),
+            sink_ptr=sinks,
         )

@@ -455,6 +455,47 @@ def load_qq_bias_tile(
 
 
 @triton.jit
+def softmax_step_keep_empty(S, M, L):
+    """``softmax_step`` for the batch-invariant fixed-segment path.
+
+    A row that has seen no unmasked key keeps ``M = -inf`` instead of pinning
+    it to 0, and ``alpha`` is exactly 1 while the row max is unchanged. Fully
+    masked tiles therefore leave the state bit-identical to skipping them, so
+    a row's result does not depend on which other rows share its tile loop.
+    """
+    m_j = tl.maximum(M, tl.max(S, axis=1))
+    m_safe = tl.where(m_j > float("-inf"), m_j, 0.0)
+    P = tl.exp(S - m_safe[:, None])
+    l_j = tl.sum(P, axis=1)
+    alpha = tl.where(M == m_j, 1.0, tl.exp(M - m_safe))  # noqa: SIM300
+    L_new = tl.fma(L, alpha, l_j)
+    return m_j, L_new, P, alpha
+
+
+@triton.jit
+def merge_softmax_segment(M_tot, L_tot, acc_tot, M_seg, L_seg, acc_seg):
+    """Fold one KV segment's online-softmax partial into a running total.
+
+    Shared by the 2D tile loop and ``reduce_segments`` in batch-invariant
+    fixed-segment mode, so both paths combine the same segments in the same
+    order with the same operations. An empty segment (``M_seg == -inf``) is
+    an exact no-op. Shapes: ``M``/``L`` ``(R,)``, ``acc`` ``(R, D)``.
+    """
+    seg_empty = M_seg == float("-inf")
+    M_new = tl.maximum(M_tot, M_seg)
+    a = tl.where(M_tot == M_new, 1.0, tl.exp(M_tot - M_new))
+    b = tl.where(M_seg == M_new, 1.0, tl.exp(M_seg - M_new))
+    L_new = tl.fma(L_seg, b, L_tot * a)
+    b_2d = tl.broadcast_to(b[:, None], acc_seg.shape)
+    a_2d = tl.broadcast_to(a[:, None], acc_tot.shape)
+    acc_new = tl.fma(acc_seg, b_2d, acc_tot * a_2d)
+    L_new = tl.where(seg_empty, L_tot, L_new)
+    acc_new = tl.where(seg_empty[:, None], acc_tot, acc_new)
+    M_new = tl.where(seg_empty, M_tot, M_new)
+    return M_new, L_new, acc_new
+
+
+@triton.jit
 def softmax_step(S, M, L):
     """Online softmax update for one tile.
 

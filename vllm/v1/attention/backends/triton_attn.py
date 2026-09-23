@@ -39,7 +39,10 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
-from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.attention.ops.triton_unified_attention import (
+    batch_invariant_segment_len,
+    unified_attention,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -94,6 +97,8 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    # Batch-invariant split-KV segment length; None outside invariant mode.
+    invariant_segment_len: int | None = None
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -152,6 +157,14 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             )
 
         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+        self.invariant_segment_len: int | None = None
+        if envs.VLLM_BATCH_INVARIANT:
+            # One buffer slot per fixed segment up to max_model_len.
+            max_model_len = model_config.max_model_len
+            self.invariant_segment_len = batch_invariant_segment_len(max_model_len)
+            self.num_par_softmax_segments = next_power_of_2(
+                -(-max_model_len // self.invariant_segment_len)
+            )
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (
@@ -245,6 +258,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            invariant_segment_len=self.invariant_segment_len,
         )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
@@ -697,6 +711,7 @@ class TritonAttentionImpl(AttentionImpl):
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
+            invariant_segment_len=attn_metadata.invariant_segment_len,
         )
 
         return output

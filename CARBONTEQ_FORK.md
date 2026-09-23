@@ -50,6 +50,21 @@ compilation.
 - A dedicated SM120 invariant-matmul config family measured against K2's real
   transposed-weight layout. It keeps fixed K-reduction tiles, tuned c4-c32
   decode/proposal buckets, and the proven large-prefill configuration.
+- A model-independent SM120 invariant-matmul rule (`_SM120_GENERIC_RULE`):
+  60 cells keyed by output width N and row count M with BLOCK_K fixed at 64, so
+  the reduction order never changes. It serves every shape the K2 table misses.
+  The fp32 LM head (`head_dtype=float32`) goes through the same invariant
+  kernel instead of cuBLAS.
+- Batch invariance for hybrid layers: the short-conv backend declares support,
+  and Qwen3.5 GDN layers use the Triton prefill, one decode kernel for pure and
+  mixed steps, and one row per program in the gated RMSNorm. Other GDN
+  families refuse invariant mode until validated.
+- Batch-invariant split-KV in the Triton unified attention kernel: KV is cut
+  into fixed segments at absolute positions (128 tokens, growing only with
+  `max_model_len`) and folded in order, so the split and single-pass kernels
+  return identical bits and the backend still picks between them by batch
+  size. The sliding-window V mask moved into the V load, which lets head-512
+  windowed layers fit SM120 shared memory.
 
 ## Compatibility constraints
 
@@ -59,6 +74,9 @@ compilation.
   least as large as policy rank plus Uno rank.
 - The target model vocabulary upper bound must be provided as
   `uno_mask_token_id`.
+- Qwen3.5 GDN layers are bit-exact across batch composition but not yet
+  across chunked-prefill split points; disable chunked prefill for full
+  reproducibility (the fork warns at startup).
 - The clean root must not be emitted separately. Removing it from the verified
   block breaks autoregressive alignment and collapsed measured acceptance.
 - Uno has no benchmark-only deterministic-noise or CUDA-graph switches. The
@@ -85,6 +103,23 @@ ruff check \
   tests/v1/attention/test_sm120_fa4.py \
   tests/v1/spec_decode/test_uno.py
 ```
+
+Batch-invariance changes are covered by:
+
+```bash
+pytest -q \
+  tests/v1/determinism/test_matmul_batch_invariant.py \
+  tests/v1/determinism/test_attention_batch_invariant_segments.py \
+  tests/kernels/attention/test_triton_unified_attention.py -k "not use_td"
+```
+
+On the RTX PRO 6000 these pass 45, 34 and 1,588 tests. End-to-end with
+`VLLM_BATCH_INVARIANT=1`, logprobs are bit-exact at c1-c32 on K2-Horizon-7B,
+LFM2.5-2.6B, Gemma-4-12B, Gemma-4-E4B, Qwen2.5-0.5B and Qwen3.5-2B/27B, and
+across staggered arrivals on K2, LFM, both Gemma models and (with chunked
+prefill off) Qwen3.5-2B. At c4 the fork
+runs 2.1-3.4x faster than the upstream invariant configuration (Gemma-4-12B
+87 -> 215 tok/s, LFM2.5-2.6B 250 -> 850 tok/s).
 
 The retained RTX PRO environment passes the focused mapping tests and the
 native GPU smokes recorded in the Posttrain consumer documentation. A real K2
