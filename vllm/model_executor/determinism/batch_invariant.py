@@ -279,7 +279,10 @@ def matmul_descriptor_persistent(
 
 
 def matmul_persistent(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -291,8 +294,10 @@ def matmul_persistent(
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    # Allocates output. The kernel accumulates in fp32 and casts on store, so a
+    # wider out_dtype (e.g. an fp32 lm_head) keeps the input-dtype config and
+    # the same reduction order.
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype or dtype)
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):

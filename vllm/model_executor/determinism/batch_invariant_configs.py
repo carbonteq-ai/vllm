@@ -293,10 +293,137 @@ _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS: dict[
     },
 }
 
+# Shape-agnostic SM120 rule for bf16 GEMMs that the exact-shape table does not
+# cover. Cells are keyed by output width N and row count M, never by an exact
+# (N, K) pair, so an unseen model still gets a decode-sized tile. It was fitted
+# across ten models' captured shapes and validated leave-one-model-out.
+#
+# BLOCK_K is fixed for every cell, so moving between M buckets as concurrency
+# changes never changes the K-reduction order: the rule is batch-invariant by
+# construction. Small-N rows use narrow BLOCK_N so a decode GEMM still launches
+# enough CTAs to pull bandwidth from all SMs. Prefill cells (M > 288) are kept
+# only where no held-out model ran more than 2% slower than the upstream tile;
+# the rest keep that tile.
+_SM120_GENERIC_BLOCK_K = 64
+_SM120_GENERIC_RULE: tuple[tuple[int, tuple[tuple[int, _MatmulMConfig], ...]], ...] = (
+    (
+        512,
+        (
+            (1, _MatmulMConfig(16, 32, 4, 4)),
+            (4, _MatmulMConfig(16, 32, 4, 4)),
+            (16, _MatmulMConfig(16, 32, 4, 4)),
+            (32, _MatmulMConfig(16, 32, 4, 4)),
+            (36, _MatmulMConfig(16, 32, 4, 4)),
+            (64, _MatmulMConfig(16, 32, 4, 4)),
+            (72, _MatmulMConfig(16, 32, 4, 4)),
+            (144, _MatmulMConfig(16, 32, 4, 4)),
+            (288, _MatmulMConfig(32, 32, 4, 4)),
+            (512, _MatmulMConfig(64, 32, 8, 4)),
+            (2048, _MatmulMConfig(128, 32, 4, 5)),
+            # Upstream tile: the fitted cell regressed on a held-out model.
+            (1 << 30, _MatmulMConfig(128, 128, 8, 3)),
+        ),
+    ),
+    (
+        2048,
+        (
+            (1, _MatmulMConfig(16, 32, 8, 5)),
+            (4, _MatmulMConfig(16, 64, 4, 5)),
+            (16, _MatmulMConfig(16, 32, 4, 5)),
+            (32, _MatmulMConfig(16, 32, 4, 5)),
+            (36, _MatmulMConfig(16, 64, 8, 5)),
+            (64, _MatmulMConfig(32, 32, 4, 5)),
+            (72, _MatmulMConfig(16, 64, 8, 5)),
+            (144, _MatmulMConfig(32, 64, 4, 5)),
+            (288, _MatmulMConfig(32, 128, 4, 5)),
+            (512, _MatmulMConfig(64, 128, 4, 4)),
+            # Upstream tile: the fitted cell regressed on a held-out model.
+            (2048, _MatmulMConfig(128, 128, 8, 3)),
+            (1 << 30, _MatmulMConfig(128, 128, 4, 3)),
+        ),
+    ),
+    (
+        8192,
+        (
+            (1, _MatmulMConfig(16, 64, 8, 5)),
+            (4, _MatmulMConfig(16, 64, 8, 5)),
+            (16, _MatmulMConfig(16, 64, 4, 5)),
+            (32, _MatmulMConfig(32, 64, 4, 5)),
+            (36, _MatmulMConfig(16, 128, 8, 5)),
+            (64, _MatmulMConfig(32, 64, 4, 5)),
+            (72, _MatmulMConfig(32, 128, 8, 5)),
+            (144, _MatmulMConfig(32, 128, 4, 5)),
+            (288, _MatmulMConfig(64, 128, 4, 5)),
+            (512, _MatmulMConfig(128, 128, 4, 3)),
+            (2048, _MatmulMConfig(128, 128, 4, 3)),
+            (1 << 30, _MatmulMConfig(128, 128, 4, 3)),
+        ),
+    ),
+    (
+        32768,
+        (
+            (1, _MatmulMConfig(16, 128, 8, 5)),
+            (4, _MatmulMConfig(16, 128, 8, 5)),
+            (16, _MatmulMConfig(16, 128, 4, 5)),
+            (32, _MatmulMConfig(32, 128, 8, 5)),
+            (36, _MatmulMConfig(16, 128, 8, 5)),
+            (64, _MatmulMConfig(64, 128, 4, 5)),
+            (72, _MatmulMConfig(32, 256, 8, 3)),
+            (144, _MatmulMConfig(32, 128, 4, 5)),
+            (288, _MatmulMConfig(64, 256, 4, 3)),
+            (512, _MatmulMConfig(128, 128, 4, 3)),
+            (2048, _MatmulMConfig(128, 128, 4, 3)),
+            # Upstream tile: the fitted cell regressed on a held-out model.
+            (1 << 30, _MatmulMConfig(128, 128, 8, 3)),
+        ),
+    ),
+    (
+        1 << 30,
+        (
+            (1, _MatmulMConfig(16, 64, 8, 5)),
+            (4, _MatmulMConfig(16, 64, 8, 5)),
+            (16, _MatmulMConfig(16, 64, 4, 5)),
+            (32, _MatmulMConfig(32, 64, 4, 5)),
+            (36, _MatmulMConfig(16, 128, 8, 5)),
+            (64, _MatmulMConfig(64, 64, 4, 5)),
+            (72, _MatmulMConfig(32, 128, 4, 5)),
+            (144, _MatmulMConfig(64, 256, 4, 3)),
+            (288, _MatmulMConfig(64, 256, 4, 3)),
+            (512, _MatmulMConfig(128, 128, 4, 3)),
+            (2048, _MatmulMConfig(128, 128, 4, 3)),
+            (1 << 30, _MatmulMConfig(128, 128, 4, 3)),
+        ),
+    ),
+)
+
 _TUNED_MATMUL_CONFIGS_FOR_DEVICE: dict[tuple[int, int], _MatmulShapeConfig] | None = (
     None
 )
+_TUNED_MATMUL_ARCH_FAMILY: str | None = None
 _TUNED_MATMUL_CONFIGS_RESOLVED = False
+
+
+def _sm120_generic_matmul_config(M: int, N: int, K: int) -> dict[str, int]:
+    """bf16 SM120 config from the (N, M) rule; K does not select a cell."""
+    del K  # BLOCK_K is fixed; K only scales work per tile.
+    rows = _SM120_GENERIC_RULE[-1][1]
+    for max_n, n_rows in _SM120_GENERIC_RULE:
+        if N <= max_n:  # noqa: SIM300
+            rows = n_rows
+            break
+    m_config = rows[-1][1]
+    for max_m, bucket_config in rows:
+        if M <= max_m:  # noqa: SIM300
+            m_config = bucket_config
+            break
+    return {
+        "BLOCK_SIZE_M": m_config.block_m,
+        "BLOCK_SIZE_N": m_config.block_n,
+        "BLOCK_SIZE_K": _SM120_GENERIC_BLOCK_K,
+        "GROUP_SIZE_M": 8,
+        "num_warps": m_config.num_warps,
+        "num_stages": m_config.num_stages,
+    }
 
 
 def _get_tuned_matmul_arch_family(capability: DeviceCapability | None) -> str | None:
@@ -315,6 +442,7 @@ def _get_tuned_matmul_arch_family(capability: DeviceCapability | None) -> str | 
 
 def resolve_tuned_matmul_configs() -> None:
     global _TUNED_MATMUL_CONFIGS_FOR_DEVICE
+    global _TUNED_MATMUL_ARCH_FAMILY
     global _TUNED_MATMUL_CONFIGS_RESOLVED
 
     if _TUNED_MATMUL_CONFIGS_RESOLVED:
@@ -325,6 +453,7 @@ def resolve_tuned_matmul_configs() -> None:
         current_platform.get_device_capability() if current_platform.is_cuda() else None
     )
     arch_family = _get_tuned_matmul_arch_family(capability)
+    _TUNED_MATMUL_ARCH_FAMILY = arch_family
     if arch_family is None:
         _TUNED_MATMUL_CONFIGS_FOR_DEVICE = None
     else:
@@ -350,6 +479,8 @@ def _get_matmul_config(
         return default
     shape_config = device_configs.get((N, K))
     if shape_config is None:
+        if _TUNED_MATMUL_ARCH_FAMILY == "sm120":
+            return _sm120_generic_matmul_config(M, N, K)
         return default
     # Values above the tuned range reuse the largest bucket;
     # shape-wide BLOCK_K keeps this batch-invariant.
