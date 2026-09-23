@@ -309,7 +309,9 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
-    def get_replay_boundaries(self, request: Request) -> tuple[int, ...]:
+    def get_replay_boundaries(
+        self, request: Request, num_computed_tokens: int = 0
+    ) -> tuple[int, ...]:
         """Positions a later request replaying this prompt can resume at.
 
         A hit is the shortest across all groups, so every group retains state
@@ -322,13 +324,26 @@ class KVCacheCoordinator(ABC):
         block-aligned prompt, where retaining just the higher one collapses the
         resend's hit to 0. The alignment is the scheduler block size, not the
         finer hash granularity, which would over-estimate the reach.
+
+        Once the request decodes, a multi-turn continuation -- a later prompt
+        that extends this prompt *and* the generated output, as every agentic
+        or chat turn does -- resumes at the last computed block, so that
+        position is reachable too. It advances each step; the states it leaves
+        behind are freed (and so evictable) as the request moves on, exactly as
+        under dense retention.
         """
+        decoding = num_computed_tokens > request.num_prompt_tokens
         if not self.eagle_group_ids:
+            if decoding:
+                return (request.num_prompt_tokens - 1, num_computed_tokens)
             return (request.num_prompt_tokens - 1,)
         block = self.scheduler_block_size
         resend = (request.num_prompt_tokens - 1) // block * block
         extension = request.num_prompt_tokens // block * block
-        return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
+        points = {max(resend - block, 0), max(extension - block, 0)}
+        if decoding:
+            points.add(max(num_computed_tokens // block * block - block, 0))
+        return tuple(sorted(points))
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request.
@@ -340,7 +355,7 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
 
         """
-        boundaries = self.get_replay_boundaries(request)
+        boundaries = self.get_replay_boundaries(request, num_computed_tokens)
         for manager in self.single_type_managers:
             if not manager.enable_caching:
                 continue
@@ -798,7 +813,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
-        boundaries = self.get_replay_boundaries(request)
+        boundaries = self.get_replay_boundaries(request, num_computed_tokens)
         for manager in self.single_type_managers:
             if not manager.enable_caching:
                 continue

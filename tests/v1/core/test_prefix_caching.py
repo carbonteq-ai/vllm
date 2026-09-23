@@ -5632,6 +5632,46 @@ def test_mamba_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=True) == 2 * block_size
 
 
+@pytest.mark.parametrize("retention", [0, None])
+def test_mamba_multi_turn_continuation_reuses_decoded_tokens(retention):
+    """A next turn extends the previous prompt *and* its generated output.
+
+    Under ``prefix_cache_retention_interval=0`` only replay boundaries keep a
+    Mamba state; if those were prompt-only, the next turn would hit no further
+    than the previous prompt and re-prefill every generated token. The
+    continuation boundary keeps the last computed block reachable, matching
+    dense retention.
+    """
+    block_size = 16
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 200, ["full", "mamba_align"]),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=retention,
+    )
+    prompt = [i for i in range(3) for _ in range(block_size)] + [3] * 7  # 55
+    req0 = make_request("0", prompt, block_size, sha256)
+    cb, nc, _ = manager.get_computed_blocks(req0)
+    assert manager.allocate_slots(req0, len(prompt), nc, cb) is not None
+    req0.append_output_token_ids([100])
+    req0.num_computed_tokens = len(prompt)
+    for step in range(30):
+        assert manager.allocate_slots(req0, 1, 0) is not None
+        req0.num_computed_tokens += 1
+        req0.append_output_token_ids([101 + step])
+    assert req0.num_computed_tokens == 85
+    manager.free(req0)
+
+    # The next turn: previous prompt + all generated tokens + a tool result.
+    turn = list(req0.all_token_ids) + [999] * 20
+    req1 = make_request("1", turn, block_size, sha256)
+    _, hit, _ = manager.get_computed_blocks(req1)
+    # The last computed position is 85, so the last full state block ends at 80.
+    # With prompt-only boundaries no decoded state is kept and the hit is 0.
+    assert hit == 5 * block_size
+
+
 @pytest.mark.skip_global_cleanup
 def test_swa_reachable_block_mask_final_partial_segment():
     """Only a final SWA horizon makes its incomplete segment tail reachable."""

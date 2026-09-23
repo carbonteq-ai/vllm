@@ -70,6 +70,15 @@ compilation.
   aligned (so its scalar/vector read split, and reduction order, cannot vary);
   other layouts keep the Triton kernel. Strided q/k/v views are no longer
   copied first.
+- Multi-turn prefix reuse for hybrid (Mamba/short-conv) and sliding-window
+  models: once a request decodes, `KVCacheCoordinator.get_replay_boundaries`
+  also makes its last computed block reachable, so the default sparse
+  retention (`prefix_cache_retention_interval=0`, upstream since #52216)
+  keeps the state a next turn needs. Before, only prompt boundaries were
+  kept and every turn re-prefilled the previous turn's generated tokens:
+  LFM2.5 AutomationBench replay at c16 prefilled 43% fewer tokens (486,770
+  to 279,538 per collection) and recomputed 0.1% instead of 9.6% of its
+  reusable context. Upstream candidate.
 
 ## Compatibility constraints
 
@@ -110,6 +119,10 @@ ruff check \
   tests/v1/attention/test_sm120_fa4.py \
   tests/v1/spec_decode/test_uno.py
 ```
+
+The multi-turn continuation boundary is covered by
+`tests/v1/core/test_prefix_caching.py -k multi_turn_continuation` (the next
+turn hits 0 tokens without it and 80 with it); the whole file passes (161).
 
 Batch-invariance changes are covered by:
 
