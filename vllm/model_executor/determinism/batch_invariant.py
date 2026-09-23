@@ -977,6 +977,28 @@ def _rms_norm_kernel(
         tl.store(output_row_start_ptr + col_idx, output, mask=mask)
 
 
+def _cuda_rms_norm_is_batch_invariant(
+    input: torch.Tensor, weight: torch.Tensor | None
+) -> bool:
+    """Whether vLLM's CUDA ``rms_norm`` gives batch-independent bits here.
+
+    With VLLM_BATCH_INVARIANT the kernel pins its block size, so a row's
+    reduction order depends only on how its read splits into a scalar prefix
+    and 16-byte vectors. That split follows the row's address, so require
+    every row to start 16-byte aligned: then it is the same for any batch.
+    """
+    elem = input.element_size()
+    return (
+        input.is_cuda
+        and 2 <= input.dim() <= 4
+        and input.stride(-1) == 1
+        and input.data_ptr() % 16 == 0
+        and all((input.stride(d) * elem) % 16 == 0 for d in range(input.dim() - 1))
+        and (input.shape[-1] * elem) % 16 == 0
+        and (weight is None or weight.dtype == input.dtype)
+    )
+
+
 def rms_norm_batch_invariant(
     input: torch.Tensor,
     weight: torch.Tensor | None,
@@ -1013,6 +1035,14 @@ def rms_norm_batch_invariant(
             f"weight dimension ({weight.shape[0]})"
         )
         weight = weight.contiguous()
+
+    if _cuda_rms_norm_is_batch_invariant(input, weight):
+        # Reads strided q/k/v views in place; no contiguous copy.
+        import vllm._custom_ops as ops
+
+        output = torch.empty(input.shape, device=input.device, dtype=input.dtype)
+        ops.rms_norm(output, input, weight, eps)
+        return output
 
     # Flatten all dimensions except the last one
     original_shape = input.shape

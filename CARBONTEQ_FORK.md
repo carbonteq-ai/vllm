@@ -65,6 +65,11 @@ compilation.
   return identical bits and the backend still picks between them by batch
   size. The sliding-window V mask moved into the V load, which lets head-512
   windowed layers fit SM120 shared memory.
+- Invariant RMSNorm without a residual uses vLLM's CUDA kernel, whose block
+  size is pinned under VLLM_BATCH_INVARIANT, whenever every row starts 16-byte
+  aligned (so its scalar/vector read split, and reduction order, cannot vary);
+  other layouts keep the Triton kernel. Strided q/k/v views are no longer
+  copied first.
 
 ## Compatibility constraints
 
@@ -113,6 +118,7 @@ pytest -q \
   tests/v1/determinism/test_matmul_batch_invariant.py \
   tests/v1/determinism/test_attention_batch_invariant_segments.py \
   tests/v1/core/test_batch_invariant_prefill_split.py \
+  tests/v1/determinism/test_rms_norm_cuda_batch_invariant.py \
   tests/kernels/attention/test_triton_unified_attention.py -k "not use_td"
 ```
 
