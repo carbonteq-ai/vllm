@@ -16,7 +16,10 @@ compilation.
 - Expected upstream: `https://github.com/vllm-project/vllm.git`
 - Development branch: `codex/sm120-attention-platform`
 - Published CarbonTeq functional commit:
-  `e1b009d3d43fa631524968241390155590f90d0a`
+  `28705a52e35688e152300de59f972f7fe56fcc12` (release `carbonteq-v0.29.1.dev3`;
+  adds generic SM120 batch-invariant GEMM, split-KV attention, GDN chunk
+  alignment, invariant CUDA RMSNorm and multi-turn prefix reuse to dev2 at
+  `fbbba6698b2f8a912b94705cfc09eb4fd7243716`)
 
 ## Maintained delta
 
