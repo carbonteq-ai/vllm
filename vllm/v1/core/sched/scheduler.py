@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -33,6 +34,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -76,6 +78,9 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# FLA_CHUNK_SIZE in vllm/third_party/flash_linear_attention/ops/utils.py.
+_GDN_INVARIANT_PREFILL_ALIGNMENT = 64
 
 
 class Scheduler(SchedulerInterface):
@@ -337,6 +342,20 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        # GDN's chunked prefill gives bit-identical results across a prefill
+        # split only when the split falls on a kernel chunk boundary
+        # (FLA_CHUNK_SIZE). Under batch invariance, end partial prefill chunks
+        # there so a prompt's result cannot depend on its neighbours' budget.
+        self.batch_invariant_prefill_alignment = (
+            _GDN_INVARIANT_PREFILL_ALIGNMENT
+            if envs.VLLM_BATCH_INVARIANT
+            and any(
+                isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
+                for group in kv_cache_config.kv_cache_groups
+            )
+            else 0
+        )
         # TODO: Support models with multiple Mamba specs that require different
         # prefill checkpoint alignments instead of selecting the first one.
         self.mamba_prefill_checkpoint_alignment = next(
@@ -406,6 +425,30 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+
+    def _batch_invariant_prefill_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        """Clip a partial prefill chunk to end on a kernel chunk boundary.
+
+        The chunk that finishes the prefill is exempt. Returns 0 when the
+        budget cannot reach the next boundary; the request then waits a step.
+        """
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        end = start + num_new_tokens
+        if start >= prefill_end or end >= prefill_end:
+            return num_new_tokens
+        alignment = self.batch_invariant_prefill_alignment
+        return max(end // alignment * alignment - start, 0)
 
     def _mamba_block_aligned_split(
         self,
@@ -673,6 +716,10 @@ class Scheduler(SchedulerInterface):
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
+                    request, num_new_tokens
+                )
+            if self.batch_invariant_prefill_alignment:
+                num_new_tokens = self._batch_invariant_prefill_split(
                     request, num_new_tokens
                 )
 
@@ -1089,18 +1136,29 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             break
-                        if (
-                            pad_spec_decode
-                            and num_new_tokens != 1 + self.num_spec_tokens
-                        ):
-                            # Alignment clipped the placeholder rows. The split
-                            # aligns prefill chunks, but the padded tail rows are
-                            # speculative positions, not prefill tokens. A padded
-                            # request must keep all 1 + num_spec rows or the
-                            # sampler's row count stops matching its query rows,
-                            # so drop the padding instead of shortening it.
-                            num_new_tokens = 1
-                            pad_spec_decode = False
+                    if self.batch_invariant_prefill_alignment:
+                        num_new_tokens = self._batch_invariant_prefill_split(
+                            request,
+                            num_new_tokens,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        )
+                        if num_new_tokens == 0:
+                            break
+                    if (
+                        self.need_mamba_block_aligned_split
+                        or self.batch_invariant_prefill_alignment
+                    ) and (
+                        pad_spec_decode and num_new_tokens != 1 + self.num_spec_tokens
+                    ):
+                        # Alignment clipped the placeholder rows. The split
+                        # aligns prefill chunks, but the padded tail rows are
+                        # speculative positions, not prefill tokens. A padded
+                        # request must keep all 1 + num_spec rows or the
+                        # sampler's row count stops matching its query rows,
+                        # so drop the padding instead of shortening it.
+                        num_new_tokens = 1
+                        pad_spec_decode = False
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:

@@ -522,16 +522,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         if (
             envs.VLLM_BATCH_INVARIANT
-            and vllm_config.scheduler_config.enable_chunked_prefill
+            and vllm_config.cache_config.enable_prefix_caching
+            and vllm_config.cache_config.mamba_cache_mode != "none"
         ):
-            # Where the scheduler splits a prompt changes the chunked delta-rule
-            # arithmetic, so a request's logprobs can still depend on what
-            # shared its prefill steps. Unsplit prompts are bit-exact.
+            # The scheduler ends partial prefill chunks on FLA_CHUNK_SIZE
+            # boundaries, which keeps chunked prefill bit-exact. A prefix-cache
+            # hit can resume a prompt elsewhere, and that is not validated.
             logger.warning_once(
-                "Batch-invariant GDN is exact across batch size and mixed "
-                "prefill/decode steps, but not across prompt split points. "
-                "Disable chunked prefill (with max_num_batched_tokens >= the "
-                "longest prompt) for fully reproducible logprobs."
+                "Batch-invariant GDN is validated across batch size, mixed "
+                "steps and chunked prefill, but not with prefix caching. "
+                "Disable prefix caching for fully reproducible logprobs."
             )
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (

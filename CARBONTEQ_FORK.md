@@ -74,9 +74,11 @@ compilation.
   least as large as policy rank plus Uno rank.
 - The target model vocabulary upper bound must be provided as
   `uno_mask_token_id`.
-- Qwen3.5 GDN layers are bit-exact across batch composition but not yet
-  across chunked-prefill split points; disable chunked prefill for full
-  reproducibility (the fork warns at startup).
+- Under batch invariance, models with GDN layers end partial prefill chunks
+  on 64-token boundaries (FLA_CHUNK_SIZE), costing at most 63 tokens of step
+  budget; the GDN chunk kernel is bit-exact only across aligned splits.
+  Prefix caching with GDN is not yet validated under invariance (the fork
+  warns at startup).
 - The clean root must not be emitted separately. Removing it from the verified
   block breaks autoregressive alignment and collapsed measured acceptance.
 - Uno has no benchmark-only deterministic-noise or CUDA-graph switches. The
@@ -110,14 +112,15 @@ Batch-invariance changes are covered by:
 pytest -q \
   tests/v1/determinism/test_matmul_batch_invariant.py \
   tests/v1/determinism/test_attention_batch_invariant_segments.py \
+  tests/v1/core/test_batch_invariant_prefill_split.py \
   tests/kernels/attention/test_triton_unified_attention.py -k "not use_td"
 ```
 
 On the RTX PRO 6000 these pass 45, 34 and 1,588 tests. End-to-end with
 `VLLM_BATCH_INVARIANT=1`, logprobs are bit-exact at c1-c32 on K2-Horizon-7B,
 LFM2.5-2.6B, Gemma-4-12B, Gemma-4-E4B, Qwen2.5-0.5B and Qwen3.5-2B/27B, and
-across staggered arrivals on K2, LFM, both Gemma models and (with chunked
-prefill off) Qwen3.5-2B. At c4 the fork
+across staggered arrivals on K2, LFM, both Gemma models and Qwen3.5-2B (with
+chunked prefill on). At c4 the fork
 runs 2.1-3.4x faster than the upstream invariant configuration (Gemma-4-12B
 87 -> 215 tok/s, LFM2.5-2.6B 250 -> 850 tok/s).
 
