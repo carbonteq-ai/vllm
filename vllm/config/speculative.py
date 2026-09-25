@@ -1440,12 +1440,30 @@ class SpeculativeConfig:
 
                 if (
                     self.method == "dspark"
-                    and "DSparkDraftModel" in self.draft_model_config.architectures
                     and self.draft_model_config.hf_config.model_type == "qwen3"
+                    and (
+                        "DSparkDraftModel" in self.draft_model_config.architectures
+                        or "Lfm2DSparkDraftModel"
+                        in self.draft_model_config.architectures
+                    )
                 ):
-                    self.draft_model_config.hf_config.architectures = [
-                        "Qwen3DSparkModel"
-                    ]
+                    # LFM2 DSpark drafters are Qwen3-style GQA stacks with
+                    # interleaved RoPE, declared as rope_is_neox_style.
+                    draft_hf_config = self.draft_model_config.hf_config
+                    rope_is_neox = getattr(draft_hf_config, "rope_is_neox_style", None)
+                    if rope_is_neox is not None:
+                        draft_hf_config.is_neox_style = bool(rope_is_neox)
+                    if (
+                        "Lfm2DSparkDraftModel" in self.draft_model_config.architectures
+                        and getattr(draft_hf_config, "confidence_head_with_markov", None)
+                        is None
+                    ):
+                        # LFM2 checkpoints omit the flag; their confidence head
+                        # reads the Markov embedding (SGLang's markov_rank > 0).
+                        draft_hf_config.confidence_head_with_markov = (
+                            getattr(draft_hf_config, "markov_rank", 0) > 0
+                        )
+                    draft_hf_config.architectures = ["Qwen3DSparkModel"]
                     self.update_arch_()
                 elif self.method == "dspark" and (
                     "Qwen3DSparkModel" not in self.draft_model_config.architectures

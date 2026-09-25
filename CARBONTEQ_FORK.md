@@ -83,6 +83,21 @@ compilation.
   to 279,538 per collection) and recomputed 0.1% instead of 9.6% of its
   reusable context. Upstream candidate.
 
+- LFM2 DSpark (candidate, `codex/lfm2-dspark`): `Lfm2ForCausalLM` implements the
+  EAGLE-3 auxiliary hidden-state interface (embedding and each layer's output,
+  `hidden + residual`), `Lfm2DSparkDraftModel` maps to `Qwen3DSparkModel` with
+  its interleaved RoPE (`rope_is_neox_style`) and Markov-fed confidence head
+  (SGLang's `markov_rank > 0` default), and LFM2/LFM2-MoE size their
+  short-conv page padding with the speculative tokens, which the runtime
+  `ShortConv` state already includes. Ported from SGLang #31041; the short-conv
+  verify rollback it adds is covered by vLLM #50272 in this base. Evidence on the
+  RTX PRO 6000 with `LiquidAI/LFM2.5-2.6B@654f9463` and
+  `LiquidAI/LFM2.5-2.6B-DSpark@458cedab`, nine speculative tokens, greedy,
+  256 output tokens (`tools/carbonteq/lfm2_dspark_check.py`): with
+  `VLLM_BATCH_INVARIANT=1` DSpark output equals target-only output for all
+  nine sequences, 2.31x at concurrency 1 and 2.11x at 32; without invariance
+  2.10x and 1.27x; 2.24-2.34 of nine draft tokens accepted per step.
+
 ## Compatibility constraints
 
 - Tensor parallel size 1 and pipeline parallel size 1.
@@ -110,6 +125,7 @@ pytest -q \
   tests/config/test_uno_speculative_config.py \
   tests/v1/attention/test_sm120_fa4.py \
   tests/v1/spec_decode/test_uno.py \
+  tests/v1/spec_decode/test_lfm2_dspark.py \
   tests/lora/test_layers.py \
   tests/lora/test_lora_manager.py
 ruff check \

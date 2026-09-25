@@ -648,6 +648,9 @@ _SPECULATIVE_DECODING_MODELS = {
         "DSparkDeepseekV4ForCausalLM",
     ),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
+    # LFM2 DSpark drafters are Qwen3-style stacks; SpeculativeConfig renames
+    # them to Qwen3DSparkModel and carries their interleaved RoPE.
+    "Lfm2DSparkDraftModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "Qwen3OmniDSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "K3DSparkModel": (
         "vllm.models.kimi_k3.nvidia.dspark_mla",
