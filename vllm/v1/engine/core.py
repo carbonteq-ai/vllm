@@ -832,6 +832,9 @@ class EngineCore:
 
         self.model_executor.reset_mm_cache()
 
+    def release_session(self, session_id: str) -> int:
+        return self.scheduler.release_session(session_id)
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

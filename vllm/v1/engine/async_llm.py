@@ -1061,6 +1061,16 @@ class AsyncLLM(EngineClient):
         await self.renderer.clear_mm_cache_async()
         await self.engine_core.reset_mm_cache_async()
 
+    async def release_session(self, session_id: str) -> int:
+        """Evict a finished session's cached prefix before live sessions'.
+
+        Call this when a multi-turn client (an agent episode or RL rollout)
+        that tagged its requests with ``session_id`` will send no more turns.
+        Returns the number of cached blocks moved to the front of the eviction
+        order; blocks shared with other live sessions keep their place.
+        """
+        return await self.engine_core.release_session_async(session_id)
+
     async def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

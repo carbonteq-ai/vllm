@@ -112,6 +112,24 @@ compilation.
   caching on. Nine speculative tokens beat five (49-52 s) and four (50-54 s)
   at this concurrency. A DSpark binding must size `kv_cache_memory_bytes` for
   target plus drafter (about 26 KiB per token for LFM2.5-2.6B).
+- Session-aware prefix-cache eviction (candidate, `codex/lfm2-dspark`):
+  `KVCacheManager` records, per `session_id`, the cached blocks its latest
+  request left (`vllm/v1/core/kv_session_tracker.py`), and
+  `release_session(session_id)` (`AsyncLLM`, `LLMEngine`, and
+  `POST /v1/sessions/release`) moves the blocks no other live session holds
+  to the front of the free queue. They stay cached until reused; a prompt
+  shared with a sibling rollout keeps its LRU place. Replaying the DSpark
+  collections above at the 4 GiB budget, releasing each episode's session
+  when it ends takes 62.3-63.2 s per collection against 65.3-65.5 s with
+  sessions tagged but not released (tracking itself costs nothing
+  measurable), at 39.5-43.0% prefix hits either way. The hit rate is bounded
+  by capacity, not eviction order: the 32 live episodes grow to about 250K
+  tokens against 157K of cache, and the scheduler preempts 52-58 running
+  requests per collection (none at 6.5 GiB). An FP8 drafter KV cache is not
+  a capacity lever on this hybrid model: hybrid page-size unification pads
+  the drafter group, so capacity rises only from 156,819 to 163,097 tokens
+  (and FlashInfer's metadata builder then reads the target's `auto` cache
+  dtype for the FP8 drafter group and fails to start).
 
 ## Compatibility constraints
 
@@ -141,6 +159,7 @@ pytest -q \
   tests/v1/attention/test_sm120_fa4.py \
   tests/v1/spec_decode/test_uno.py \
   tests/v1/spec_decode/test_lfm2_dspark.py \
+  tests/v1/core/test_kv_session_release.py \
   tests/lora/test_layers.py \
   tests/lora/test_lora_manager.py
 ruff check \

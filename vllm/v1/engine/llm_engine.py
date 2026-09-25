@@ -352,6 +352,10 @@ class LLMEngine:
         self.renderer.clear_mm_cache()
         self.engine_core.reset_mm_cache()
 
+    def release_session(self, session_id: str) -> int:
+        """Evict a finished session's cached prefix before live sessions'."""
+        return self.engine_core.release_session(session_id)
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

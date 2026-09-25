@@ -174,6 +174,10 @@ class EngineClient(ABC):
         """Reset the encoder cache."""
         ...
 
+    async def release_session(self, session_id: str) -> int:
+        """Evict a finished session's cached prefix before live sessions'."""
+        return 0
+
     @abstractmethod
     async def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

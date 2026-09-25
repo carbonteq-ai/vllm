@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_session_tracker import SessionBlockTracker
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -195,6 +196,9 @@ class KVCacheManager:
                     manager.fine_grained_prefix_cache = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        # Cached blocks left by each live session, so a finished session's
+        # prefix is evicted before the prefixes of sessions still running.
+        self.sessions = SessionBlockTracker()
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
             for manager in self.coordinator.single_type_managers
@@ -611,6 +615,7 @@ class KVCacheManager:
             request: The request to free the blocks.
 
         """
+        self._record_session(request)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -645,7 +650,33 @@ class KVCacheManager:
             The request's blocks in allocation order.
 
         """
+        self._record_session(request)
         return self.coordinator.pop_blocks_for_free(request.request_id)
+
+    def _record_session(self, request: Request) -> None:
+        if self.enable_caching and request.session_id is not None:
+            blocks = self.coordinator.get_blocks(request.request_id)
+            self.sessions.record(
+                request.session_id, list(itertools.chain.from_iterable(blocks))
+            )
+
+    def release_session(self, session_id: str) -> int:
+        """Evict a finished session's cached prefix before live sessions'.
+
+        Blocks shared with another live session, such as a prompt common to
+        a group of rollouts, and blocks in use keep their place.
+
+        Returns:
+            The number of blocks moved to the front of the eviction order.
+
+        """
+        released = self.sessions.release(session_id)
+        pools = dict.fromkeys(block.pool for block in released)
+        return sum(
+            pool.evict_first([block for block in released if block.pool is pool])
+            for pool in pools
+            if pool is not None
+        )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
@@ -668,6 +699,7 @@ class KVCacheManager:
         """
         if not self.coordinator.reset_prefix_cache():
             return False
+        self.sessions.clear()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True

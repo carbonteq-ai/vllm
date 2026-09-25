@@ -182,6 +182,9 @@ class EngineCoreClient(ABC):
     def reset_mm_cache(self) -> None:
         raise NotImplementedError
 
+    def release_session(self, session_id: str) -> int:
+        raise NotImplementedError
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -275,6 +278,9 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def reset_mm_cache_async(self) -> None:
+        raise NotImplementedError
+
+    async def release_session_async(self, session_id: str) -> int:
         raise NotImplementedError
 
     async def reset_prefix_cache_async(
@@ -386,6 +392,9 @@ class InprocClient(EngineCoreClient):
 
     def reset_mm_cache(self) -> None:
         self.engine_core.reset_mm_cache()
+
+    def release_session(self, session_id: str) -> int:
+        return self.engine_core.release_session(session_id)
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
@@ -1005,6 +1014,9 @@ class SyncMPClient(MPClient):
     def reset_mm_cache(self) -> None:
         self.call_utility("reset_mm_cache")
 
+    def release_session(self, session_id: str) -> int:
+        return self.call_utility("release_session", session_id)
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -1263,6 +1275,9 @@ class AsyncMPClient(MPClient):
 
     async def reset_mm_cache_async(self) -> None:
         await self.call_utility_async("reset_mm_cache")
+
+    async def release_session_async(self, session_id: str) -> int:
+        return await self.call_utility_async("release_session", session_id)
 
     async def reset_prefix_cache_async(
         self, reset_running_requests: bool = False, reset_connector: bool = False

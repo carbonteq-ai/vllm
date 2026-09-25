@@ -212,6 +212,13 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def release_session(self, session_id: str) -> int:
+        """Evict a finished session's cached prefix before live sessions'.
+
+        Returns the number of blocks moved to the front of the eviction order.
+        """
+        return 0
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

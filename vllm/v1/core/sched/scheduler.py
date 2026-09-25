@@ -2773,6 +2773,9 @@ class Scheduler(SchedulerInterface):
             )
         )
 
+    def release_session(self, session_id: str) -> int:
+        return self.kv_cache_manager.release_session(session_id)
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

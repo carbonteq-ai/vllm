@@ -798,6 +798,27 @@ class BlockPool:
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 
+    def evict_first(self, blocks: Sequence[KVCacheBlock]) -> int:
+        """Move free cached blocks to the front of the free queue.
+
+        The blocks stay cached, so a request can still hit them, but they are
+        the first reused when new blocks are needed. ``blocks`` is in eviction
+        order; blocks from other pools or in use are skipped.
+
+        Returns:
+            The number of blocks moved.
+
+        """
+        moved = [
+            block
+            for block in blocks
+            if block.pool is self and block.ref_cnt == 0 and not block.is_null
+        ]
+        for block in moved:
+            self.free_block_queue.remove(block)
+        self.free_block_queue.prepend_n(moved)
+        return len(moved)
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 
