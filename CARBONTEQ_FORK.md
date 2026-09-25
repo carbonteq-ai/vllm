@@ -97,6 +97,21 @@ compilation.
   `VLLM_BATCH_INVARIANT=1` DSpark output equals target-only output for all
   nine sequences, 2.31x at concurrency 1 and 2.11x at 32; without invariance
   2.10x and 1.27x; 2.24-2.34 of nine draft tokens accepted per step.
+- DFlash and DSpark keep their trailing prefix-cache block
+  (`SpeculativeConfig.use_eagle_block_drop` returns False for them, as vLLM
+  #54163 and #57110 propose): their drafter KV at position i depends only on
+  the target's state at i, so the EAGLE last-block drop only discarded exact
+  cached blocks. Replaying 32 recorded LFM2.5 AutomationBench episodes per
+  collection (16 tasks, temperature 0.8, rank-4 LoRA,
+  `tools/carbonteq/lfm2_dspark_replay.sh`): the rollout binding without
+  speculation takes 84-87 s per collection at 87.9% prefix hits; DSpark with
+  the drop and the binding's 4 GiB KV budget 77 s at 14% (the drafter's KV
+  shares the budget, cutting target capacity by 38%); with a 6.5 GiB budget
+  60-64 s at 45%; with the drop removed 46 s at 88.0%, 1.85x faster.
+  Batch-invariant greedy output still equals target-only output with prefix
+  caching on. Nine speculative tokens beat five (49-52 s) and four (50-54 s)
+  at this concurrency. A DSpark binding must size `kv_cache_memory_bytes` for
+  target plus drafter (about 26 KiB per token for LFM2.5-2.6B).
 
 ## Compatibility constraints
 

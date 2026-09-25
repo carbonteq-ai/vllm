@@ -2020,7 +2020,17 @@ class SpeculativeConfig:
         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
 
     def use_eagle_block_drop(self) -> bool:
-        """Whether volatile trailing cache blocks should be discarded."""
+        """Whether volatile trailing cache blocks should be discarded.
+
+        EAGLE's KV at position i also depends on token i + 1, so its trailing
+        prefix-cache block is volatile. DFlash and DSpark write position i's
+        drafter KV only from the target's hidden state at i, so their cached
+        blocks are exact and keeping them preserves multi-turn prefix reuse
+        (vLLM #54163, #57110): on LFM2.5 AutomationBench collections the drop
+        cut prefix hits from 88% to 45% at unchanged acceptance.
+        """
+        if self.method in ("dflash", "dspark"):
+            return False
         return self.use_eagle() and not self.disable_eagle_block_drop
 
     def use_dflash(self) -> bool:

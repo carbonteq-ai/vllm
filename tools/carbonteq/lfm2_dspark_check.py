@@ -10,6 +10,7 @@ Each mode runs in its own process so the engines never share GPU memory.
 
 import argparse
 import json
+import os
 import time
 
 TARGET = "LiquidAI/LFM2.5-2.6B"
@@ -39,6 +40,7 @@ def run(mode: str, out: str, concurrency: int, max_tokens: int) -> None:
             "model": DRAFT,
             "revision": DRAFT_REVISION,
             "num_speculative_tokens": 9,
+            **json.loads(os.environ.get("SPEC_EXTRA_JSON", "{}")),
         }
     llm = LLM(
         TARGET,
@@ -47,6 +49,7 @@ def run(mode: str, out: str, concurrency: int, max_tokens: int) -> None:
         gpu_memory_utilization=0.6,
         seed=0,
         disable_log_stats=False,
+        enable_prefix_caching=True,
         **kwargs,
     )
     tokenizer = llm.get_tokenizer()
