@@ -16,10 +16,10 @@ compilation.
 - Expected upstream: `https://github.com/vllm-project/vllm.git`
 - Development branch: `codex/sm120-attention-platform`
 - Published CarbonTeq functional commit:
-  `28705a52e35688e152300de59f972f7fe56fcc12` (release `carbonteq-v0.29.1.dev3`;
-  adds generic SM120 batch-invariant GEMM, split-KV attention, GDN chunk
-  alignment, invariant CUDA RMSNorm and multi-turn prefix reuse to dev2 at
-  `fbbba6698b2f8a912b94705cfc09eb4fd7243716`)
+  `9387f18617b1d132a4f0a910b92764b328461d4a` (release `carbonteq-v0.29.1.dev4`;
+  adds LFM2 DSpark speculative decoding, the DFlash/DSpark trailing
+  prefix-cache block and session-aware prefix-cache eviction to dev3 at
+  `564ff2b43d499f5d17bcee554d126360b768dd98`)
 
 ## Maintained delta
 
@@ -83,7 +83,7 @@ compilation.
   to 279,538 per collection) and recomputed 0.1% instead of 9.6% of its
   reusable context. Upstream candidate.
 
-- LFM2 DSpark (candidate, `codex/lfm2-dspark`): `Lfm2ForCausalLM` implements the
+- LFM2 DSpark (dev4): `Lfm2ForCausalLM` implements the
   EAGLE-3 auxiliary hidden-state interface (embedding and each layer's output,
   `hidden + residual`), `Lfm2DSparkDraftModel` maps to `Qwen3DSparkModel` with
   its interleaved RoPE (`rope_is_neox_style`) and Markov-fed confidence head
@@ -112,7 +112,7 @@ compilation.
   caching on. Nine speculative tokens beat five (49-52 s) and four (50-54 s)
   at this concurrency. A DSpark binding must size `kv_cache_memory_bytes` for
   target plus drafter (about 26 KiB per token for LFM2.5-2.6B).
-- Session-aware prefix-cache eviction (candidate, `codex/lfm2-dspark`):
+- Session-aware prefix-cache eviction (dev4):
   `KVCacheManager` records, per `session_id`, the cached blocks its latest
   request left (`vllm/v1/core/kv_session_tracker.py`), and
   `release_session(session_id)` (`AsyncLLM`, `LLMEngine`, and
